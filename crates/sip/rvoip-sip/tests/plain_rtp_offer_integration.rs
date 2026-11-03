@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use rvoip_sip::api::events::Event;
 use rvoip_sip::api::unified::{Config, UnifiedCoordinator};
-use rvoip_sip::{DtlsSetupRole, SrtpKeyingMode};
+use rvoip_sip::SrtpKeyingMode;
 
 fn reserve_loopback_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
@@ -55,13 +55,13 @@ async fn plain_rtp_per_call_offer_reaches_a_plain_peer_and_answers() {
         bob_port = reserve_loopback_port();
     }
 
-    // Alice is a WebRTC-style endpoint: SRTP required, DTLS keying. Only this
-    // one call is switched to plain RTP.
+    // Alice is a secure-voice endpoint: SRTP offered and required (SDES, so the
+    // test runs with default features). Only this one call is switched to plain
+    // RTP.
     let mut alice_cfg = Config::local("alice", alice_port);
     alice_cfg.offer_srtp = true;
     alice_cfg.srtp_required = true;
-    alice_cfg.srtp_keying = SrtpKeyingMode::DtlsSrtp;
-    alice_cfg.dtls_setup_role = DtlsSetupRole::Actpass;
+    alice_cfg.srtp_keying = SrtpKeyingMode::Sdes;
 
     // Bob is a plain RTP peer (no DTLS, no SRTP, no ICE).
     let bob_cfg = Config::local("bob", bob_port);
