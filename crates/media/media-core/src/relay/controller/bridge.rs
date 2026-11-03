@@ -49,7 +49,7 @@ use super::codec_runtime::normalized_codec_name;
 use super::types::{MediaConfig, NEGOTIATED_FMTP_PARAMETER};
 use super::MediaSessionController;
 
-/// RFC 4733 telephone-event payload type. Both legs of a SudoSIP-style bridge
+/// RFC 4733 telephone-event payload type. Both legs of a bridged call
 /// advertise it at the 8 kHz telephone-event clock, so in transcode mode these
 /// packets are relayed verbatim (payload **and** timestamp) instead of being
 /// decoded as audio.
