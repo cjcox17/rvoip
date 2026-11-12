@@ -2432,6 +2432,34 @@ pub struct Config {
     /// ```
     pub rtcp_mux_required: bool,
 
+    /// Answer an inbound **plain-RTP** offer with plain RTP even when this
+    /// endpoint otherwise requires secure media.
+    ///
+    /// A plain-RTP offer is one whose audio line uses `RTP/AVP` and carries
+    /// neither a DTLS fingerprint nor an `a=crypto:` line: what a PSTN carrier
+    /// trunk or a desk phone sends. With this set, such an offer is exempt
+    /// from [`Config::srtp_required`] and [`Config::rtcp_mux_required`] for
+    /// that call only, the answer is `RTP/AVP`, and later offers this side
+    /// generates on the dialog (hold, resume) stay plain. Offers that carry
+    /// keying are negotiated exactly as before, so a WebRTC peer is never
+    /// downgraded: the exemption is chosen by the offer, and a browser cannot
+    /// send a plain one.
+    ///
+    /// This is the answering counterpart of
+    /// [`OutboundCallBuilder::with_plain_rtp`](crate::api::send::OutboundCallBuilder::with_plain_rtp).
+    /// Default `false`.
+    ///
+    /// ```
+    /// use rvoip_sip::Config;
+    ///
+    /// // A B2BUA with WebRTC softphones on one side and a carrier trunk on
+    /// // the other: require DTLS-SRTP, but take the carrier's RTP/AVP calls.
+    /// let mut config = Config::on("pbx", "203.0.113.10".parse().unwrap(), 5060);
+    /// config.srtp_required = true;
+    /// config.accept_plain_rtp_offers = true;
+    /// ```
+    pub accept_plain_rtp_offers: bool,
+
     /// How often to sample per-call media quality and publish
     /// [`Event::MediaQualityChanged`](crate::Event::MediaQualityChanged) for
     /// every call that has sent or received RTP.
@@ -3226,6 +3254,7 @@ impl std::fmt::Debug for Config {
             .field("offer_srtp", &self.offer_srtp)
             .field("offer_rtcp_mux", &self.offer_rtcp_mux)
             .field("rtcp_mux_required", &self.rtcp_mux_required)
+            .field("accept_plain_rtp_offers", &self.accept_plain_rtp_offers)
             .field("rtcp_non_mux", &self.rtcp_non_mux)
             .field("srtp_keying", &self.srtp_keying)
             .field("dtls_setup_role", &self.dtls_setup_role)
@@ -3413,6 +3442,7 @@ impl Config {
             offer_srtp: false,
             offer_rtcp_mux: true,
             rtcp_mux_required: false,
+            accept_plain_rtp_offers: false,
             media_quality_interval: None,
             rtcp_non_mux: false,
             rtcp_xr_voip_metrics: false,
@@ -3546,6 +3576,7 @@ impl Config {
             offer_srtp: false,
             offer_rtcp_mux: true,
             rtcp_mux_required: false,
+            accept_plain_rtp_offers: false,
             media_quality_interval: None,
             rtcp_non_mux: false,
             rtcp_xr_voip_metrics: false,
@@ -9875,6 +9906,7 @@ impl UnifiedCoordinator {
         media_adapter_inner.set_media_mode(config.media_mode);
         media_adapter_inner.set_offer_rtcp_mux(config.offer_rtcp_mux);
         media_adapter_inner.set_rtcp_mux_required(config.rtcp_mux_required);
+        media_adapter_inner.set_accept_plain_rtp_offers(config.accept_plain_rtp_offers);
         media_adapter_inner.set_rtcp_non_mux(config.rtcp_non_mux);
         media_adapter_inner.set_rtcp_reporting_policy(
             config.rtcp_xr_voip_metrics,
@@ -12699,13 +12731,15 @@ impl UnifiedCoordinator {
             .helpers
             .negotiated_media_config(session)
             .await?
-            .map(|(config, payload_type)| crate::api::lifecycle::NegotiatedMedia {
-                codec: config.codec,
-                payload_type,
-                clock_rate: config.sample_rate,
-                channels: config.channels,
-                fmtp: config.fmtp,
-            }))
+            .map(
+                |(config, payload_type)| crate::api::lifecycle::NegotiatedMedia {
+                    codec: config.codec,
+                    payload_type,
+                    clock_rate: config.sample_rate,
+                    channels: config.channels,
+                    fmtp: config.fmtp,
+                },
+            ))
     }
 
     /// Exact number of range-backed RTP/RTCP ports currently leased by SIP

@@ -1449,6 +1449,11 @@ pub struct MediaAdapter {
     /// machine surfaces as `488 Not Acceptable Here`.
     srtp_required: bool,
 
+    /// From `Config::accept_plain_rtp_offers`: an inbound offer on `RTP/AVP`
+    /// with no keying is answered with plain RTP, exempt from
+    /// `srtp_required` and `rtcp_mux_required` for that call.
+    accept_plain_rtp_offers: bool,
+
     /// AMR discontinuous transmission, from `Config::amr_dtx`. Sender-side
     /// local policy: it is stamped into the media configuration when the
     /// negotiated codec is applied, and media-core turns it into the codec's
@@ -1644,6 +1649,7 @@ impl MediaAdapter {
             ice_policy: crate::adapters::ice_adapter::SipIcePolicy::Disabled,
             ice: Arc::new(crate::adapters::ice_adapter::IceRuntimes::default()),
             srtp_required: false,
+            accept_plain_rtp_offers: false,
             amr_dtx: false,
             amr_auto_cmr: false,
             srtp_offered_suites: vec![
@@ -2381,6 +2387,22 @@ impl MediaAdapter {
         self.rtcp_mux_required = required;
     }
 
+    /// Wired from `Config::accept_plain_rtp_offers`.
+    pub(crate) fn set_accept_plain_rtp_offers(&mut self, accept: bool) {
+        self.accept_plain_rtp_offers = accept;
+    }
+
+    /// Whether `offer` is a plain-RTP offer this endpoint has been told to
+    /// answer in kind: `RTP/AVP` audio with no `a=crypto:` line and no DTLS
+    /// fingerprint, with `accept_plain_rtp_offers` set. Any keying in the
+    /// offer disqualifies it, so a secure offer is never treated as plain.
+    fn accepts_as_plain_rtp(&self, offer: &SdpSession, has_crypto: bool, has_dtls: bool) -> bool {
+        self.accept_plain_rtp_offers
+            && !has_crypto
+            && !has_dtls
+            && audio_transport(offer).is_some_and(|transport| transport == "RTP/AVP")
+    }
+
     /// RTCP reporting policy, wired from `Config::rtcp_xr_voip_metrics` and
     /// `Config::rtcp_reduced_minimum_interval` at coordinator boot.
     pub(crate) fn set_rtcp_reporting_policy(
@@ -2811,12 +2833,29 @@ impl MediaAdapter {
     pub(crate) fn validate_inbound_sdp_offer(&self, remote_sdp: &str) -> SrtpDetailedResult<()> {
         let parsed_offer = SdpSession::from_str(remote_sdp)
             .map_err(|_| bounded_sdp_failure("remote-offer", "syntax"))?;
-        validate_rtcp_mux(&parsed_offer, self.rtcp_mux_required)?;
         self.parse_sdp_connection(remote_sdp)?;
 
         let offered_crypto = Self::extract_audio_crypto(&parsed_offer);
         #[cfg(feature = "dtls-srtp")]
         let offered_dtls = parse_dtls_offer(&parsed_offer)?;
+        #[cfg(feature = "dtls-srtp")]
+        let has_dtls = offered_dtls.is_some();
+        #[cfg(not(feature = "dtls-srtp"))]
+        let has_dtls = false;
+        // A plain-RTP offer we were configured to accept is exempt from the
+        // secure-media and RTCP-mux requirements for this call.
+        let plain = self.accepts_as_plain_rtp(&parsed_offer, !offered_crypto.is_empty(), has_dtls);
+        validate_rtcp_mux(&parsed_offer, self.rtcp_mux_required && !plain)?;
+        if plain {
+            compute_answer_formats(
+                &parsed_offer,
+                &self.effective_offered_formats(),
+                self.strict_codec_matching,
+                false,
+                false,
+            )?;
+            return Ok(());
+        }
         #[cfg(feature = "dtls-srtp")]
         let dtls_acceptable = self.offer_dtls_srtp && offered_dtls.is_some();
         #[cfg(not(feature = "dtls-srtp"))]
@@ -2911,7 +2950,6 @@ impl MediaAdapter {
         // and SDES handling.
         let parsed_offer = SdpSession::from_str(remote_sdp)
             .map_err(|_| bounded_sdp_failure("remote-offer", "syntax"))?;
-        validate_rtcp_mux(&parsed_offer, self.rtcp_mux_required)?;
         let (remote_ip, remote_port) = self.parse_sdp_connection(remote_sdp)?;
         // ICE (RFC 8839): honor the peer's offer when policy allows. A
         // detected mismatch means a middlebox rewrote the SDP after the
@@ -2948,6 +2986,28 @@ impl MediaAdapter {
             .to_string();
         #[cfg(feature = "dtls-srtp")]
         let offered_dtls = parse_dtls_offer(&parsed_offer)?;
+        #[cfg(feature = "dtls-srtp")]
+        let offer_has_dtls = offered_dtls.is_some();
+        #[cfg(not(feature = "dtls-srtp"))]
+        let offer_has_dtls = false;
+        // A plain-RTP offer (carrier trunk, desk phone) that this endpoint was
+        // configured to accept is answered with plain RTP: the secure-media and
+        // RTCP-mux requirements are lifted for this call only. The decision is
+        // made by the offer itself, so an offer carrying any keying still goes
+        // through the unchanged secure path below.
+        let plain_rtp_answer =
+            self.accepts_as_plain_rtp(&parsed_offer, !offered_crypto.is_empty(), offer_has_dtls);
+        let srtp_required = self.srtp_required && !plain_rtp_answer;
+        validate_rtcp_mux(&parsed_offer, self.rtcp_mux_required && !plain_rtp_answer)?;
+        if plain_rtp_answer {
+            tracing::info!(
+                session = %session_id.0,
+                "answering a plain-RTP offer with RTP/AVP (accept_plain_rtp_offers)"
+            );
+            // Offers this side generates later on the dialog (hold, resume)
+            // must stay plain too.
+            session.plain_rtp_offer = true;
+        }
         #[cfg(feature = "dtls-srtp")]
         let (dtls_answer_attrs, staged_dtls, dtls_rejected) =
             match (self.offer_dtls_srtp, offered_dtls) {
@@ -2987,7 +3047,7 @@ impl MediaAdapter {
                         false,
                     )
                 }
-                (true, None) if self.srtp_required => {
+                (true, None) if srtp_required => {
                     return Err(SessionError::SDPNegotiationFailed(
                         "srtp_required is set but the SDP offer carries no DTLS-SRTP fingerprint"
                             .to_string(),
@@ -3023,7 +3083,7 @@ impl MediaAdapter {
                 emit_srtp_diag(SdpDiagnostic::SdesOfferAccepted);
             }
             (Some(chosen), Some(pair), false)
-        } else if offered_crypto.is_empty() && self.srtp_required {
+        } else if offered_crypto.is_empty() && srtp_required {
             return Err(SessionError::SDPNegotiationFailed(
                 "srtp_required is set but the SDP offer carries no a=crypto: line".into(),
             )
@@ -3101,8 +3161,8 @@ impl MediaAdapter {
             &parsed_offer,
             &self.effective_offered_formats(),
             self.strict_codec_matching,
-            self.offer_srtp,
-            self.srtp_required,
+            self.offer_srtp && !plain_rtp_answer,
+            srtp_required,
             session.inbound_audio_codecs.as_deref(),
         )?;
         let negotiated_payload_type = select_primary_audio_payload(&formats)
@@ -6010,6 +6070,7 @@ impl Clone for MediaAdapter {
             ice_policy: self.ice_policy,
             ice: Arc::clone(&self.ice),
             srtp_required: self.srtp_required,
+            accept_plain_rtp_offers: self.accept_plain_rtp_offers,
             amr_dtx: self.amr_dtx,
             amr_auto_cmr: self.amr_auto_cmr,
             amr_mode_set: self.amr_mode_set.clone(),
