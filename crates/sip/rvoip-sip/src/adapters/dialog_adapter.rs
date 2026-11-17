@@ -3564,21 +3564,25 @@ impl DialogAdapter {
         mut opts: UpdateRequestOptions,
         auth_header: Option<(&str, String)>,
     ) -> Result<TransactionKey> {
+        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
+        // RFC 3261 §12.2.1.1: an in-dialog request follows the dialog's
+        // route set; the outbound proxy only pre-loads a route when there
+        // is none (see `in_dialog_outbound_proxy`).
+        let in_dialog_proxy = self.in_dialog_proxy(&dialog_id);
         opts.extra_headers = match auth_header {
             Some((name, value)) => apply_outbound_extras_policy_with_auth(
                 rvoip_sip_core::types::Method::Update,
                 opts.extra_headers,
-                self.outbound_proxy_uri.as_ref(),
+                in_dialog_proxy,
                 name,
                 value,
             )?,
             None => apply_outbound_extras_policy(
                 rvoip_sip_core::types::Method::Update,
                 opts.extra_headers,
-                self.outbound_proxy_uri.as_ref(),
+                in_dialog_proxy,
             )?,
         };
-        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
         self.dialog_api
             .send_update_with_options(&dialog_id, opts)
             .await
@@ -3632,6 +3636,11 @@ impl DialogAdapter {
         // A challenged precomputed credential is replaced, not appended.
         // Keeping it would cause dialog-core to materialize a second
         // Authorization field beside the exact retry header below.
+        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
+        // RFC 3261 §12.2.1.1: an in-dialog request follows the dialog's
+        // route set; the outbound proxy only pre-loads a route when there
+        // is none (see `in_dialog_outbound_proxy`).
+        let in_dialog_proxy = self.in_dialog_proxy(&dialog_id);
         if auth_header.is_some() {
             opts.precomputed_authorization = None;
         }
@@ -3639,17 +3648,16 @@ impl DialogAdapter {
             Some((name, value)) => apply_outbound_extras_policy_with_auth(
                 rvoip_sip_core::types::Method::Invite,
                 opts.extra_headers,
-                self.outbound_proxy_uri.as_ref(),
+                in_dialog_proxy,
                 name,
                 value,
             )?,
             None => apply_outbound_extras_policy(
                 rvoip_sip_core::types::Method::Invite,
                 opts.extra_headers,
-                self.outbound_proxy_uri.as_ref(),
+                in_dialog_proxy,
             )?,
         };
-        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
         self.dialog_api
             .send_reinvite_with_options(&dialog_id, opts)
             .await
@@ -3689,21 +3697,25 @@ impl DialogAdapter {
         mut opts: ReferRequestOptions,
         auth_header: Option<(&str, String)>,
     ) -> Result<TransactionKey> {
+        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
+        // RFC 3261 §12.2.1.1: an in-dialog request follows the dialog's
+        // route set; the outbound proxy only pre-loads a route when there
+        // is none (see `in_dialog_outbound_proxy`).
+        let in_dialog_proxy = self.in_dialog_proxy(&dialog_id);
         opts.extra_headers = match auth_header {
             Some((name, value)) => apply_outbound_extras_policy_with_auth(
                 rvoip_sip_core::types::Method::Refer,
                 opts.extra_headers,
-                self.outbound_proxy_uri.as_ref(),
+                in_dialog_proxy,
                 name,
                 value,
             )?,
             None => apply_outbound_extras_policy(
                 rvoip_sip_core::types::Method::Refer,
                 opts.extra_headers,
-                self.outbound_proxy_uri.as_ref(),
+                in_dialog_proxy,
             )?,
         };
-        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
         self.dialog_api
             .send_refer_with_options(&dialog_id, opts)
             .await
@@ -3740,21 +3752,25 @@ impl DialogAdapter {
         mut opts: InfoRequestOptions,
         auth_header: Option<(&str, String)>,
     ) -> Result<TransactionKey> {
+        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
+        // RFC 3261 §12.2.1.1: an in-dialog request follows the dialog's
+        // route set; the outbound proxy only pre-loads a route when there
+        // is none (see `in_dialog_outbound_proxy`).
+        let in_dialog_proxy = self.in_dialog_proxy(&dialog_id);
         opts.extra_headers = match auth_header {
             Some((name, value)) => apply_outbound_extras_policy_with_auth(
                 rvoip_sip_core::types::Method::Info,
                 opts.extra_headers,
-                self.outbound_proxy_uri.as_ref(),
+                in_dialog_proxy,
                 name,
                 value,
             )?,
             None => apply_outbound_extras_policy(
                 rvoip_sip_core::types::Method::Info,
                 opts.extra_headers,
-                self.outbound_proxy_uri.as_ref(),
+                in_dialog_proxy,
             )?,
         };
-        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
         self.dialog_api
             .send_info_with_options(&dialog_id, opts)
             .await
@@ -3780,6 +3796,24 @@ impl DialogAdapter {
         .await
     }
 
+    /// The outbound proxy to pre-load on an in-dialog request for
+    /// `dialog_id`: the configured proxy only when the dialog has no route
+    /// set. A dialog whose route set is unknown (already gone) keeps the
+    /// proxy, as before.
+    fn in_dialog_proxy(
+        &self,
+        dialog_id: &RvoipDialogId,
+    ) -> Option<&rvoip_sip_core::types::uri::Uri> {
+        let route_set_empty = self
+            .dialog_api
+            .dialog_manager()
+            .core()
+            .get_dialog(dialog_id)
+            .map(|dialog| dialog.route_set.is_empty())
+            .unwrap_or(true);
+        in_dialog_outbound_proxy(route_set_empty, self.outbound_proxy_uri.as_ref())
+    }
+
     /// Dispatch a first-attempt BYE while the executor already owns this
     /// session's exact state-machine lane. Retained authorization bookkeeping
     /// stays in the executor's working state and is published by its one
@@ -3789,13 +3823,17 @@ impl DialogAdapter {
         session: &mut SessionState,
         mut opts: ByeRequestOptions,
     ) -> Result<()> {
+        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)
+            .map_err(|_| SessionError::SessionNotFound(session.session_id.0.clone()))?;
+        // RFC 3261 §12.2.1.1: an in-dialog request follows the dialog's
+        // route set; the outbound proxy only pre-loads a route when there
+        // is none (see `in_dialog_outbound_proxy`).
+        let in_dialog_proxy = self.in_dialog_proxy(&dialog_id);
         opts.extra_headers = apply_outbound_extras_policy(
             rvoip_sip_core::types::Method::Bye,
             opts.extra_headers,
-            self.outbound_proxy_uri.as_ref(),
+            in_dialog_proxy,
         )?;
-        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)
-            .map_err(|_| SessionError::SessionNotFound(session.session_id.0.clone()))?;
         let dialog = self
             .dialog_api
             .dialog_manager()
@@ -4247,21 +4285,25 @@ impl DialogAdapter {
         mut opts: NotifyRequestOptions,
         auth_header: Option<(&str, String)>,
     ) -> Result<TransactionKey> {
+        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
+        // RFC 3261 §12.2.1.1: an in-dialog request follows the dialog's
+        // route set; the outbound proxy only pre-loads a route when there
+        // is none (see `in_dialog_outbound_proxy`).
+        let in_dialog_proxy = self.in_dialog_proxy(&dialog_id);
         opts.extra_headers = match auth_header {
             Some((name, value)) => apply_outbound_extras_policy_with_auth(
                 rvoip_sip_core::types::Method::Notify,
                 opts.extra_headers,
-                self.outbound_proxy_uri.as_ref(),
+                in_dialog_proxy,
                 name,
                 value,
             )?,
             None => apply_outbound_extras_policy(
                 rvoip_sip_core::types::Method::Notify,
                 opts.extra_headers,
-                self.outbound_proxy_uri.as_ref(),
+                in_dialog_proxy,
             )?,
         };
-        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
         self.dialog_api
             .send_notify_with_options(&dialog_id, opts)
             .await
@@ -4446,14 +4488,18 @@ impl DialogAdapter {
         auth_header_name: &str,
         auth_header_value: String,
     ) -> Result<()> {
+        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
+        // RFC 3261 §12.2.1.1: an in-dialog request follows the dialog's
+        // route set; the outbound proxy only pre-loads a route when there
+        // is none (see `in_dialog_outbound_proxy`).
+        let in_dialog_proxy = self.in_dialog_proxy(&dialog_id);
         opts.extra_headers = apply_outbound_extras_policy_with_auth(
             rvoip_sip_core::types::Method::Bye,
             opts.extra_headers,
-            self.outbound_proxy_uri.as_ref(),
+            in_dialog_proxy,
             auth_header_name,
             auth_header_value,
         )?;
-        let dialog_id = resolve_dialog_for_lane_owned_session(self.store.as_ref(), session)?;
         // Authentication retries must sign and retain the challenged
         // generation's exact Request-URI.
         let handle = session.lifecycle_handle.as_ref().ok_or_else(|| {
@@ -8355,6 +8401,34 @@ mod tests {
     }
 
     #[test]
+    fn in_dialog_request_with_route_set_adds_no_proxy_route() {
+        let proxy = Uri::from_str("sips:10.150.0.39:5062;transport=tls;lr").unwrap();
+        let proxy_for_bye = in_dialog_outbound_proxy(false, Some(&proxy));
+        assert!(proxy_for_bye.is_none());
+        let extras = apply_outbound_extras_policy(
+            rvoip_sip_core::types::Method::Bye,
+            Vec::new(),
+            proxy_for_bye,
+        )
+        .unwrap();
+        assert!(
+            extras.iter().all(|h| !matches!(h, TypedHeader::Route(_))),
+            "a BYE in a record-routed dialog must not carry the outbound proxy"
+        );
+    }
+
+    #[test]
+    fn in_dialog_request_without_route_set_keeps_proxy() {
+        let proxy = Uri::from_str("sip:sbc.example.com;lr").unwrap();
+        assert_eq!(
+            in_dialog_outbound_proxy(true, Some(&proxy)).map(|u| u.to_string()),
+            Some("sip:sbc.example.com;lr".to_string())
+        );
+        assert!(in_dialog_outbound_proxy(true, None).is_none());
+        assert!(in_dialog_outbound_proxy(false, None).is_none());
+    }
+
+    #[test]
     fn prepend_outbound_proxy_route_without_proxy_is_identity() {
         let pai_uri = Uri::from_str("sip:alice@pai.example.com").unwrap();
         let existing = vec![TypedHeader::PAssertedIdentity(
@@ -8584,6 +8658,26 @@ pub(crate) fn prepend_outbound_proxy_route(
         headers.insert(0, TypedHeader::Route(Route::with_uri(uri.clone())));
     }
     headers
+}
+
+/// RFC 3261 §12.2.1.1 — which outbound proxy an in-dialog request
+/// (BYE, UPDATE, re-INVITE, REFER, INFO, NOTIFY) pre-loads as a `Route`.
+///
+/// A dialog with a route set is routed by that set alone: its first entry
+/// is already the proxy that record-routed the dialog. Pre-loading the
+/// outbound proxy as well puts it in an *extra* `Route` after the route set,
+/// so the last proxy on the far side forwards the request to it (for a
+/// private proxy address that fails, e.g. a carrier's 500 to a BYE). Only
+/// a dialog without a route set keeps the configured proxy.
+pub(crate) fn in_dialog_outbound_proxy(
+    route_set_empty: bool,
+    outbound_proxy_uri: Option<&rvoip_sip_core::types::uri::Uri>,
+) -> Option<&rvoip_sip_core::types::uri::Uri> {
+    if route_set_empty {
+        outbound_proxy_uri
+    } else {
+        None
+    }
 }
 
 /// SIP_API_DESIGN_2 §5.4 + §6.1 — the canonical pre-dispatch step for
