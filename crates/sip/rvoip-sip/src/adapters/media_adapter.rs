@@ -898,10 +898,7 @@ fn validate_uac_audio_answer(
             // offer (commonly telephone-event, sometimes CN). Ignore those
             // unknown formats instead of failing the call: the primary audio
             // format still has to come from the offer (checked below).
-            tracing::debug!(
-                payload_type,
-                "ignoring answer format that was not offered"
-            );
+            tracing::debug!(payload_type, "ignoring answer format that was not offered");
             continue;
         }
         if !sdp_payload_codec_available(answer, payload_type) {
@@ -2428,31 +2425,69 @@ impl MediaAdapter {
     /// RTCP socket.
     ///
     /// `remote_offer` is the peer's offer when this side will answer, or
-    /// `None` when this side makes the offer. An offerer cannot know whether
-    /// the answer will decline mux, so it reserves; an answerer reserves only
-    /// for an offer without `a=rtcp-mux`. Never with ICE (component 1 only),
-    /// DTLS-SRTP (RFC 5764 §4.1 would need a second DTLS association on the
-    /// RTCP port), strict mux, or signalling-only media.
-    fn wants_separate_rtcp_port(&self, remote_offer: Option<&str>) -> bool {
-        if !self.rtcp_non_mux
-            || self.rtcp_mux_required
+    /// `None` when this side makes the offer. `plain_rtp_offer` is the
+    /// session's per-call plain-RTP flag
+    /// ([`OutboundCallBuilder::with_plain_rtp`](crate::api::send::OutboundCallBuilder::with_plain_rtp)).
+    ///
+    /// The decision is per session. A plain-RTP session (a UAC plain-RTP
+    /// offer, or a UAS answering an offer it accepts as plain RTP, see
+    /// `Config::accept_plain_rtp_offers`) uses neither ICE, DTLS-SRTP nor
+    /// mandatory mux, so it reserves whenever the peer may not multiplex:
+    /// always as offerer (a plain offer carries no `a=rtcp-mux`), and as
+    /// answerer for an offer without `a=rtcp-mux`. This holds even when the
+    /// endpoint offers ICE, DTLS-SRTP or strict mux to its other sessions.
+    ///
+    /// Any other session follows the endpoint profile: an offerer cannot
+    /// know whether the answer will decline mux, so it reserves; an answerer
+    /// reserves only for an offer without `a=rtcp-mux`. Never with ICE
+    /// (component 1 only), DTLS-SRTP (RFC 5764 §4.1 would need a second DTLS
+    /// association on the RTCP port) or strict mux. Signalling-only media
+    /// never reserves.
+    fn wants_separate_rtcp_port(&self, remote_offer: Option<&str>, plain_rtp_offer: bool) -> bool {
+        if !self.rtcp_non_mux || self.signaling_only_local_port().is_some() {
+            return false;
+        }
+        let parsed_offer = remote_offer.map(SdpSession::from_str);
+        let plain_session = plain_rtp_offer
+            || matches!(&parsed_offer, Some(Ok(offer)) if self.answers_as_plain_rtp_without_ice(offer));
+        if plain_session {
+            return match &parsed_offer {
+                Some(Ok(offer)) => !audio_rtcp_mux(offer),
+                Some(Err(_)) | None => true,
+            };
+        }
+        if self.rtcp_mux_required
             || self.offer_dtls_srtp
             || self.ice_policy != crate::adapters::ice_adapter::SipIcePolicy::Disabled
-            || self.signaling_only_local_port().is_some()
         {
             return false;
         }
-        let Some(offer) = remote_offer else {
-            return true;
-        };
-        match SdpSession::from_str(offer) {
-            Ok(offer) => {
+        match parsed_offer {
+            None => true,
+            Some(Ok(offer)) => {
                 !audio_rtcp_mux(&offer)
                     && !audio_transport(&offer)
                         .is_some_and(|transport| transport.to_ascii_uppercase().contains("TLS"))
             }
-            Err(_) => true,
+            Some(Err(_)) => true,
         }
+    }
+
+    /// Whether this endpoint will answer `offer` as a plain-RTP call
+    /// ([`Self::accepts_as_plain_rtp`]) without running ICE on it. An offer
+    /// that carries ICE material this endpoint would answer with ICE stays on
+    /// component 1 only, so it gets no separate RTCP port.
+    fn answers_as_plain_rtp_without_ice(&self, offer: &SdpSession) -> bool {
+        let has_crypto = !Self::extract_audio_crypto(offer).is_empty();
+        // A DTLS fingerprint, even a malformed one, is keying: not plain.
+        #[cfg(feature = "dtls-srtp")]
+        let has_dtls = !matches!(parse_dtls_offer(offer), Ok(None));
+        #[cfg(not(feature = "dtls-srtp"))]
+        let has_dtls = false;
+        let answers_with_ice = self.ice_policy
+            != crate::adapters::ice_adapter::SipIcePolicy::Disabled
+            && crate::adapters::ice_adapter::extract_remote_ice(offer).is_some();
+        self.accepts_as_plain_rtp(offer, has_crypto, has_dtls) && !answers_with_ice
     }
 
     /// Add the RTP/RTCP multiplexing attributes every local offer carries.
@@ -4131,11 +4166,7 @@ impl MediaAdapter {
 
         let handle = self
             .controller
-            .bridge_sessions_with_mode(
-                exact_a.dialog_id.clone(),
-                exact_b.dialog_id.clone(),
-                mode,
-            )
+            .bridge_sessions_with_mode(exact_a.dialog_id.clone(), exact_b.dialog_id.clone(), mode)
             .await?;
         if !self.media_is_still_exact(&exact_a) || !self.media_is_still_exact(&exact_b) {
             drop(handle);
@@ -4273,21 +4304,26 @@ impl MediaAdapter {
         &self,
         session_id: &SessionId,
     ) -> Result<crate::types::MediaSessionId> {
-        self.create_session_reserving(session_id, self.wants_separate_rtcp_port(None))
+        self.create_session_reserving(session_id, self.wants_separate_rtcp_port(None, false))
             .await
     }
 
     /// Create a new media session for a call that answers `remote_offer`,
-    /// or makes the offer when it is `None`. Reserves a separate RTCP port
+    /// or makes the offer when it is `None`; `plain_rtp_offer` is the
+    /// session's per-call plain-RTP flag. Reserves a separate RTCP port
     /// only when the peer may decline rtcp-mux; see
     /// [`Config::rtcp_non_mux`](crate::api::unified::Config::rtcp_non_mux).
     pub(crate) async fn create_session_for_offer(
         &self,
         session_id: &SessionId,
         remote_offer: Option<&str>,
+        plain_rtp_offer: bool,
     ) -> Result<crate::types::MediaSessionId> {
-        self.create_session_reserving(session_id, self.wants_separate_rtcp_port(remote_offer))
-            .await
+        self.create_session_reserving(
+            session_id,
+            self.wants_separate_rtcp_port(remote_offer, plain_rtp_offer),
+        )
+        .await
     }
 
     async fn create_session_reserving(
@@ -4857,34 +4893,35 @@ impl MediaAdapter {
         // advertise ICE/DTLS-SRTP/SDES even when the endpoint is configured for
         // WebRTC; the answer is validated against this offer.
         let plain_rtp = session.plain_rtp_offer;
-        let ice_material =
-            if !plain_rtp && self.ice_policy != crate::adapters::ice_adapter::SipIcePolicy::Disabled {
-                let local_port = info.rtp_port.unwrap_or(info.config.local_addr.port());
-                let host_addr = SocketAddr::new(self.local_ip, local_port);
-                let public_sock = public.map(|sa| {
-                    SocketAddr::new(
-                        sa.ip(),
-                        if sa.port() != 0 {
-                            sa.port()
-                        } else {
-                            local_port
-                        },
-                    )
-                });
-                self.ice
-                    .ensure_local(
-                        &session_id,
-                        dialog_id,
-                        &self.controller,
-                        self.ice_policy,
-                        true,
-                        host_addr,
-                        public_sock,
-                    )
-                    .await
-            } else {
-                None
-            };
+        let ice_material = if !plain_rtp
+            && self.ice_policy != crate::adapters::ice_adapter::SipIcePolicy::Disabled
+        {
+            let local_port = info.rtp_port.unwrap_or(info.config.local_addr.port());
+            let host_addr = SocketAddr::new(self.local_ip, local_port);
+            let public_sock = public.map(|sa| {
+                SocketAddr::new(
+                    sa.ip(),
+                    if sa.port() != 0 {
+                        sa.port()
+                    } else {
+                        local_port
+                    },
+                )
+            });
+            self.ice
+                .ensure_local(
+                    &session_id,
+                    dialog_id,
+                    &self.controller,
+                    self.ice_policy,
+                    true,
+                    host_addr,
+                    public_sock,
+                )
+                .await
+        } else {
+            None
+        };
 
         // Profile + keying. DTLS-SRTP carries a certificate fingerprint and
         // setup role; SDES carries a=crypto key material. They are mutually
@@ -4956,7 +4993,14 @@ impl MediaAdapter {
         // the advertised RTP port is the local one (no port translation).
         let local_rtp_port = info.rtp_port.unwrap_or(info.config.local_addr.port());
         let offer_rtcp_port = info.rtcp_port.filter(|_| port == local_rtp_port);
-        if !plain_rtp {
+        if plain_rtp {
+            // A plain-RTP offer never offers mux. When a separate RTCP socket
+            // is bound and reachable, name it (RFC 3605) so the peer sends
+            // its RTCP there.
+            if let Some(rtcp_port) = offer_rtcp_port {
+                media_builder = media_builder.attribute("rtcp", Some(rtcp_port.to_string()));
+            }
+        } else {
             media_builder = self.with_offer_rtcp_mux_attributes(media_builder, offer_rtcp_port);
         }
         if dtls_offer_attrs.is_some() {
@@ -7034,6 +7078,19 @@ mod sdp_format_tests {
         remote_offer: Option<&str>,
         configure: impl FnOnce(&mut MediaAdapter),
     ) -> NonMuxCall {
+        non_mux_call_with(case, role, port_base, remote_offer, false, configure).await
+    }
+
+    /// [`non_mux_call`] for a session whose per-call plain-RTP flag
+    /// (`with_plain_rtp`) is `plain_rtp_offer`.
+    async fn non_mux_call_with(
+        case: &str,
+        role: crate::state_table::types::Role,
+        port_base: u16,
+        remote_offer: Option<&str>,
+        plain_rtp_offer: bool,
+        configure: impl FnOnce(&mut MediaAdapter),
+    ) -> NonMuxCall {
         use rvoip_media_core::relay::controller::MediaSessionController;
         use std::net::Ipv4Addr;
 
@@ -7056,7 +7113,7 @@ mod sdp_format_tests {
         );
         configure(&mut adapter);
         let dialog_id = adapter
-            .create_session_for_offer(&session_id, remote_offer)
+            .create_session_for_offer(&session_id, remote_offer, plain_rtp_offer)
             .await
             .expect("create managed media");
         let handle = store
@@ -7067,6 +7124,7 @@ mod sdp_format_tests {
             .await
             .expect("load exact session");
         working.media_session_id = Some(dialog_id.clone());
+        working.plain_rtp_offer = plain_rtp_offer;
         working.media_session_ready = true;
         working.local_media_direction = crate::types::MediaDirection::SendRecv;
         {
@@ -7385,21 +7443,21 @@ mod sdp_format_tests {
             16100,
         );
         adapter.set_rtcp_non_mux(true);
-        assert!(adapter.wants_separate_rtcp_port(None));
+        assert!(adapter.wants_separate_rtcp_port(None, false));
         let plain_offer = build_answer("peer", "127.0.0.1", 18_000);
-        assert!(adapter.wants_separate_rtcp_port(Some(&plain_offer)));
+        assert!(adapter.wants_separate_rtcp_port(Some(&plain_offer), false));
         let mux_offer = format!("{plain_offer}a=rtcp-mux\r\n");
-        assert!(!adapter.wants_separate_rtcp_port(Some(&mux_offer)));
+        assert!(!adapter.wants_separate_rtcp_port(Some(&mux_offer), false));
         let dtls_offer = plain_offer.replace("RTP/AVP", "UDP/TLS/RTP/SAVP");
-        assert!(!adapter.wants_separate_rtcp_port(Some(&dtls_offer)));
+        assert!(!adapter.wants_separate_rtcp_port(Some(&dtls_offer), false));
         adapter.set_ice_policy(crate::adapters::ice_adapter::SipIcePolicy::Full);
-        assert!(!adapter.wants_separate_rtcp_port(None));
+        assert!(!adapter.wants_separate_rtcp_port(None, false));
         adapter.set_ice_policy(crate::adapters::ice_adapter::SipIcePolicy::Disabled);
         adapter.set_dtls_srtp_policy(true);
-        assert!(!adapter.wants_separate_rtcp_port(None));
+        assert!(!adapter.wants_separate_rtcp_port(None, false));
         adapter.set_dtls_srtp_policy(false);
         adapter.set_media_mode(MediaMode::SignalingOnly { sdp_rtp_port: 9 });
-        assert!(!adapter.wants_separate_rtcp_port(None));
+        assert!(!adapter.wants_separate_rtcp_port(None, false));
     }
 
     #[tokio::test]
@@ -7450,6 +7508,219 @@ mod sdp_format_tests {
             .expect("the answerer's RTCP must reach the offerer's RTP port + 1");
         assert_eq!(source.port(), rtcp_port);
         assert!(!rtcp_arrives(&peer_rtp, Duration::from_millis(800)).await);
+        call.hang_up().await;
+    }
+
+    /// A WebRTC-profile endpoint: ICE, DTLS-SRTP and rtcp-mux required,
+    /// carrier offers accepted as plain RTP, and separate-port RTCP on.
+    fn webrtc_profile_with_rtcp_non_mux(adapter: &mut MediaAdapter) {
+        adapter.set_rtcp_non_mux(true);
+        adapter.set_rtcp_mux_required(true);
+        adapter.set_dtls_srtp_policy(true);
+        adapter.set_ice_policy(crate::adapters::ice_adapter::SipIcePolicy::Full);
+        adapter.set_accept_plain_rtp_offers(true);
+    }
+
+    #[tokio::test]
+    async fn rtcp_non_mux_is_decided_per_session_on_a_webrtc_profile() {
+        let mut adapter = MediaAdapter::new(
+            Arc::new(rvoip_media_core::relay::controller::MediaSessionController::new()),
+            Arc::new(SessionStore::new()),
+            "127.0.0.1".parse().unwrap(),
+            16000,
+            16100,
+        );
+        webrtc_profile_with_rtcp_non_mux(&mut adapter);
+        // WebRTC sessions keep rtcp-mux only.
+        assert!(!adapter.wants_separate_rtcp_port(None, false));
+        let plain_offer = build_answer("peer", "127.0.0.1", 18_000);
+        let dtls_offer = plain_offer.replace("RTP/AVP", "UDP/TLS/RTP/SAVP");
+        assert!(!adapter.wants_separate_rtcp_port(Some(&dtls_offer), false));
+        // A UAC plain-RTP offer reserves.
+        assert!(adapter.wants_separate_rtcp_port(None, true));
+        // A UAS plain-RTP offer reserves unless it offers mux.
+        assert!(adapter.wants_separate_rtcp_port(Some(&plain_offer), false));
+        let mux_offer = format!("{plain_offer}a=rtcp-mux\r\n");
+        assert!(!adapter.wants_separate_rtcp_port(Some(&mux_offer), false));
+        // Keying makes an RTP/AVP offer secure, never plain.
+        let sdes_offer = format!(
+            "{plain_offer}a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n"
+        );
+        assert!(!adapter.wants_separate_rtcp_port(Some(&sdes_offer), false));
+        // A plain offer answered with ICE stays on component 1.
+        let ice_offer = format!(
+            "{plain_offer}a=ice-ufrag:abcd\r\na=ice-pwd:0123456789abcdefghijkl\r\na=candidate:1 1 UDP 2130706431 127.0.0.1 18000 typ host\r\n"
+        );
+        assert!(!adapter.wants_separate_rtcp_port(Some(&ice_offer), false));
+        // Without accept_plain_rtp_offers the offer is answered by the
+        // endpoint profile, which does not reserve.
+        adapter.set_accept_plain_rtp_offers(false);
+        assert!(!adapter.wants_separate_rtcp_port(Some(&plain_offer), false));
+        // The option off reserves nothing, plain or not.
+        adapter.set_accept_plain_rtp_offers(true);
+        adapter.set_rtcp_non_mux(false);
+        assert!(!adapter.wants_separate_rtcp_port(None, true));
+        assert!(!adapter.wants_separate_rtcp_port(Some(&plain_offer), false));
+    }
+
+    /// Wait until the call has an RTT sample from the peer's SR.
+    async fn await_rtt(call: &NonMuxCall) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let stats = call.stats().await;
+            if stats.rtt_ms.is_some() {
+                assert!(stats.rtcp_packets_received >= 1);
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the plain peer's RTCP was not parsed: {stats:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rtcp_non_mux_gives_a_plain_rtp_uac_leg_rtcp_and_rtt_on_a_webrtc_profile() {
+        use crate::state_table::types::Role;
+        let mut call = non_mux_call_with(
+            "webrtc-plain-uac",
+            Role::UAC,
+            27_300,
+            None,
+            true,
+            webrtc_profile_with_rtcp_non_mux,
+        )
+        .await;
+        let offer = call.offer().await;
+        let (rtp_port, rtcp_port) = sdp_ports(&offer);
+        assert!(offer.contains(" RTP/AVP "), "{offer}");
+        assert!(!offer.contains("a=rtcp-mux"), "{offer}");
+        assert!(!offer.contains("a=fingerprint"), "{offer}");
+        assert!(!offer.contains("a=ice-ufrag"), "{offer}");
+        assert_eq!(rtp_port % 2, 0, "RTP port must be even: {offer}");
+        assert_eq!(rtcp_port, Some(rtp_port + 1), "{offer}");
+        assert!(
+            offer.contains(&format!("a=rtcp:{}\r\n", rtp_port + 1)),
+            "{offer}"
+        );
+        assert_eq!(call.info().await.rtcp_port, Some(rtp_port + 1));
+        let local_rtcp = SocketAddr::from(([127, 0, 0, 1], rtp_port + 1));
+
+        let (peer_rtp, peer_rtcp) = bind_peer_port_pair().await;
+        call.accept_answer(&build_answer(
+            "peer",
+            "127.0.0.1",
+            peer_rtp.local_addr().unwrap().port(),
+        ))
+        .await;
+        assert_eq!(call.info().await.rtcp_port, Some(rtp_port + 1));
+
+        // Our RR/SR reaches the carrier's RTP port + 1 from our RTCP port.
+        let (report, source) = recv_rtcp_until(&peer_rtcp, Duration::from_secs(3), |_| true)
+            .await
+            .expect("periodic RTCP must reach the plain peer's RTCP port");
+        assert_eq!(source, local_rtcp);
+        // The carrier's SR on our RTCP port yields an RTT sample.
+        peer_rtcp
+            .send_to(&peer_sender_report(report_ssrc(&report)), local_rtcp)
+            .await
+            .unwrap();
+        await_rtt(&call).await;
+        assert!(
+            !rtcp_arrives(&peer_rtp, Duration::from_millis(800)).await,
+            "RTCP reached the RTP port of a non-mux peer"
+        );
+        call.hang_up().await;
+    }
+
+    #[tokio::test]
+    async fn rtcp_non_mux_gives_a_plain_rtp_uas_leg_rtcp_and_rtt_on_a_webrtc_profile() {
+        use crate::state_table::types::Role;
+        let (peer_rtp, peer_rtcp) = bind_peer_port_pair().await;
+        let plain_offer = build_answer("peer", "127.0.0.1", peer_rtp.local_addr().unwrap().port());
+        let mut call = non_mux_call(
+            "webrtc-plain-uas",
+            Role::UAS,
+            27_400,
+            Some(&plain_offer),
+            webrtc_profile_with_rtcp_non_mux,
+        )
+        .await;
+        let rtcp_port = call
+            .info()
+            .await
+            .rtcp_port
+            .expect("RTCP port for a plain-RTP offer");
+        let (answer, _) = call
+            .adapter
+            .negotiate_sdp_as_uas_lane_owned(&mut call.working, &plain_offer)
+            .await
+            .expect("answer the plain offer");
+        assert!(answer.contains(" RTP/AVP "), "{answer}");
+        assert!(!audio_rtcp_mux(&answer.parse().unwrap()), "{answer}");
+        assert_eq!(
+            sdp_ports(&answer),
+            (rtcp_port - 1, Some(rtcp_port)),
+            "{answer}"
+        );
+        assert!(call.working.plain_rtp_offer);
+        call.adapter
+            .commit_staged_media_negotiation_lane_owned(&mut call.working)
+            .await
+            .expect("commit");
+        let (report, source) = recv_rtcp_until(&peer_rtcp, Duration::from_secs(3), |_| true)
+            .await
+            .expect("the answerer's RTCP must reach the carrier's RTP port + 1");
+        assert_eq!(source.port(), rtcp_port);
+        peer_rtcp
+            .send_to(
+                &peer_sender_report(report_ssrc(&report)),
+                SocketAddr::from(([127, 0, 0, 1], rtcp_port)),
+            )
+            .await
+            .unwrap();
+        await_rtt(&call).await;
+        assert!(!rtcp_arrives(&peer_rtp, Duration::from_millis(800)).await);
+        call.hang_up().await;
+    }
+
+    #[tokio::test]
+    async fn rtcp_non_mux_keeps_rtcp_mux_on_a_webrtc_leg() {
+        use crate::state_table::types::Role;
+        let mut call = non_mux_call(
+            "webrtc-dtls-uac",
+            Role::UAC,
+            27_500,
+            None,
+            webrtc_profile_with_rtcp_non_mux,
+        )
+        .await;
+        assert_eq!(call.info().await.rtcp_port, None);
+        assert_eq!(call.controller.allocated_port_count().await, 1);
+        #[cfg(feature = "dtls-srtp")]
+        {
+            let offer = call.offer().await;
+            assert!(offer.contains("UDP/TLS/RTP/SAVP"), "{offer}");
+            assert!(offer.contains("a=rtcp-mux\r\n"), "{offer}");
+            assert!(offer.contains("a=rtcp-mux-only\r\n"), "{offer}");
+            assert!(!offer.contains("a=rtcp:"), "{offer}");
+        }
+        call.hang_up().await;
+
+        // A browser's DTLS offer is answered without a separate port.
+        let dtls_offer =
+            build_answer("peer", "127.0.0.1", 18_000).replace("RTP/AVP", "UDP/TLS/RTP/SAVP");
+        let call = non_mux_call(
+            "webrtc-dtls-uas",
+            Role::UAS,
+            27_600,
+            Some(&format!("{dtls_offer}a=rtcp-mux\r\n")),
+            webrtc_profile_with_rtcp_non_mux,
+        )
+        .await;
+        assert_eq!(call.info().await.rtcp_port, None);
+        assert_eq!(call.controller.allocated_port_count().await, 1);
         call.hang_up().await;
     }
 
@@ -9887,7 +10158,10 @@ a=fmtp:101 0-15\r\n";
             .unwrap();
         let (payload_type, codec, clock_rate, channels) =
             validate_uac_audio_answer(&offer, &carrier_answer, true).expect("carrier answer");
-        assert_eq!((payload_type, codec.as_str(), clock_rate, channels), (0, "PCMU", 8_000, 1));
+        assert_eq!(
+            (payload_type, codec.as_str(), clock_rate, channels),
+            (0, "PCMU", 8_000, 1)
+        );
 
         let changed = SdpBuilder::new("Session")
             .origin("-", "3", "3", "IN", "IP4", "127.0.0.1")

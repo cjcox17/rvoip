@@ -2094,14 +2094,20 @@ pub(crate) async fn execute_action(
             #[cfg(feature = "perf-call-setup-diagnostics")]
             let started = std::time::Instant::now();
             // An inbound call answers the INVITE's offer when it carried one;
-            // every other new session makes the offer itself.
+            // every other new session makes the offer itself. A per-call
+            // plain-RTP offer (`with_plain_rtp`) decides the separate RTCP
+            // port on its own, whatever the endpoint's WebRTC profile.
             let remote_offer = if session.role == crate::state_table::Role::UAS {
                 session.remote_sdp.as_deref()
             } else {
                 None
             };
             let media_id = media_adapter
-                .create_session_for_offer(&session.session_id, remote_offer)
+                .create_session_for_offer(
+                    &session.session_id,
+                    remote_offer,
+                    session.plain_rtp_offer,
+                )
                 .await?;
             #[cfg(feature = "perf-call-setup-diagnostics")]
             crate::call_setup_diag::record_stage(
