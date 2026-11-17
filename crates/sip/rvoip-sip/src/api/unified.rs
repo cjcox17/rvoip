@@ -2491,8 +2491,9 @@ pub struct Config {
     ///   Calls rvoip offers (outbound INVITEs, late-SDP 200 OKs) reserve the
     ///   pair up front, because the answer may decline mux; inbound calls
     ///   reserve it only when the offer lacks `a=rtcp-mux`.
-    /// - Offers carry `a=rtcp:<port>` (RFC 3605) next to `a=rtcp-mux`, and
-    ///   answers to non-mux offers carry it too.
+    /// - Offers carry `a=rtcp:<port>` (RFC 3605) next to `a=rtcp-mux` (a
+    ///   plain-RTP offer carries it alone), and answers to non-mux offers
+    ///   carry it too.
     /// - When the peer declines mux, periodic SR/RR reports and the
     ///   close-time BYE go from our RTCP port to the peer's `a=rtcp:`
     ///   address, or its RTP port + 1 when it names none. Reports arriving
@@ -2512,11 +2513,26 @@ pub struct Config {
     /// Cost: a call that keeps its RTCP port uses two ports, so a media port
     /// range filled with such calls holds half as many calls (size
     /// [`Config::media_port_start`]..=[`Config::media_port_end`]
-    /// accordingly). Ignored, and no port reserved, when ICE is enabled
-    /// (ICE here negotiates RTP's component only), with DTLS-SRTP keying
-    /// (RFC 5764 §4.1 would need a second DTLS handshake on the RTCP port),
-    /// in strict [`Config::rtcp_mux_required`] mode, and in signalling-only
-    /// media mode.
+    /// accordingly).
+    ///
+    /// The decision is made per call:
+    /// - **Plain-RTP calls** — an outbound call made
+    ///   [`with_plain_rtp`](crate::api::send::OutboundCallBuilder::with_plain_rtp),
+    ///   or an inbound `RTP/AVP` offer answered in kind under
+    ///   [`Config::accept_plain_rtp_offers`] — get the separate RTCP port
+    ///   even when this endpoint offers ICE, DTLS-SRTP or strict
+    ///   [`Config::rtcp_mux_required`] to its other calls, since none of
+    ///   those apply to a plain call. A carrier leg on a WebRTC-profile
+    ///   endpoint therefore still gets SR/RR and round-trip time. (An inbound
+    ///   plain offer that carries ICE material this endpoint answers with
+    ///   ICE is the exception: ICE negotiates RTP's component only.)
+    /// - **Every other call** follows the endpoint profile: no port is
+    ///   reserved when ICE is enabled (ICE here negotiates RTP's component
+    ///   only), with DTLS-SRTP keying (RFC 5764 §4.1 would need a second
+    ///   DTLS handshake on the RTCP port), or in strict
+    ///   [`Config::rtcp_mux_required`] mode. WebRTC calls keep rtcp-mux.
+    ///
+    /// Signalling-only media mode never reserves a port.
     ///
     /// Default: `false` — RTCP flows only to peers that multiplex.
     pub rtcp_non_mux: bool,
