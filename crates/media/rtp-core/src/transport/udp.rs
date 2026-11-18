@@ -245,6 +245,8 @@ use crate::Result;
 pub struct TransportReceiveDiagnostics {
     /// Datagrams read from the RTP socket.
     pub datagrams: u64,
+    /// Datagrams read from the separate RTCP socket (non-mux legs only).
+    pub rtcp_socket_datagrams: u64,
     /// RTP packets delivered to the session (after SRTP and symmetric-RTP).
     pub rtp_delivered: u64,
     /// STUN datagrams handed to the ICE agent.
@@ -266,6 +268,7 @@ pub struct TransportReceiveDiagnostics {
 #[derive(Debug, Default)]
 struct ReceiveCounters {
     datagrams: AtomicU64,
+    rtcp_socket_datagrams: AtomicU64,
     rtp_delivered: AtomicU64,
     stun: AtomicU64,
     dtls_forwarded: AtomicU64,
@@ -284,6 +287,7 @@ impl ReceiveCounters {
     fn snapshot(&self) -> TransportReceiveDiagnostics {
         TransportReceiveDiagnostics {
             datagrams: self.datagrams.load(Ordering::Relaxed),
+            rtcp_socket_datagrams: self.rtcp_socket_datagrams.load(Ordering::Relaxed),
             rtp_delivered: self.rtp_delivered.load(Ordering::Relaxed),
             stun: self.stun.load(Ordering::Relaxed),
             dtls_forwarded: self.dtls_forwarded.load(Ordering::Relaxed),
@@ -430,7 +434,7 @@ pub struct UdpRtpTransport {
     /// [`Self::set_remote_rtp_addr`]. Unlike [`Self::remote_rtp_addr`] it is
     /// never overwritten by symmetric-RTP learning; the receive loop lets a
     /// packet from it outrank a learned source (see `symmetric.rs`).
-    signalled_rtp_addr: Arc<ArcSwapOption<SocketAddr>>,
+    signalled_rtp_addr: Arc<ArcSwapOption<(SocketAddr, Instant)>>,
 
     /// Receive-loop outcome counters ([`Self::receive_diagnostics`]).
     receive_counters: Arc<ReceiveCounters>,
@@ -1175,6 +1179,7 @@ impl UdpRtpTransport {
         let remote_rtp_addr = self.remote_rtp_addr.clone();
         let remote_rtcp_addr = self.remote_rtcp_addr.clone();
         let latched_rtp_ssrc = self.latched_rtp_ssrc.clone();
+        let counters = self.receive_counters.clone();
 
         spawn_memory_tracked("rtp_core.udp_transport.rtcp_receiver_task", async move {
             let mut observed_generation = symmetric_rtp_generation.load(Ordering::Acquire);
@@ -1190,6 +1195,7 @@ impl UdpRtpTransport {
                 // Receive packet
                 match rtcp_socket.recv_from(&mut buffer).await {
                     Ok((size, addr)) => {
+                        ReceiveCounters::bump(&counters.rtcp_socket_datagrams);
                         let rtcp_data = if secure_media_required.load(Ordering::Acquire) {
                             let mut guard = srtp_recv.lock();
                             let Some(context) = guard.as_mut() else {
@@ -1328,7 +1334,8 @@ impl UdpRtpTransport {
     /// Set the remote RTP address
     pub async fn set_remote_rtp_addr(&self, addr: SocketAddr) {
         self.symmetric_rtp_latched.store(false, Ordering::Release);
-        self.signalled_rtp_addr.store(Some(Arc::new(addr)));
+        self.signalled_rtp_addr
+            .store(Some(Arc::new((addr, Instant::now()))));
         self.remote_rtp_addr.store(Some(Arc::new(addr)));
         self.symmetric_rtp_generation.fetch_add(1, Ordering::AcqRel);
     }
@@ -1408,7 +1415,10 @@ impl UdpRtpTransport {
 
     /// The peer's signalled RTP address (SDP or ICE), never a learned one.
     pub fn signalled_rtp_addr(&self) -> Option<SocketAddr> {
-        self.signalled_rtp_addr.load().as_deref().copied()
+        self.signalled_rtp_addr
+            .load()
+            .as_deref()
+            .map(|(addr, _)| *addr)
     }
 
     /// Whether this transport only accepts and sends SRTP.

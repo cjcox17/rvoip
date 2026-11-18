@@ -90,6 +90,13 @@ pub struct PortAllocatorConfig {
     /// this to the expected active media-session count to avoid rehashing under
     /// call setup bursts.
     pub capacity_hint: usize,
+
+    /// Start the sequential/incremental cursor at a random point of the
+    /// range instead of its first port; allocation stays sequential (and
+    /// RTP-even/RTCP-odd paired) from there. A restarted process then does
+    /// not hand its first calls exactly the ports its predecessor's calls
+    /// used, which their far ends may still be streaming to.
+    pub randomize_start_cursor: bool,
 }
 
 impl Default for PortAllocatorConfig {
@@ -108,6 +115,7 @@ impl Default for PortAllocatorConfig {
             allocation_retries: 50,
             validate_ports: true,
             capacity_hint: 0,
+            randomize_start_cursor: false,
         }
     }
 }
@@ -269,9 +277,24 @@ impl PortAllocator {
             quarantined_ports: Arc::new(Mutex::new(HashMap::new())),
             last_released_cleanup: Arc::new(Mutex::new(Instant::now())),
             session_ports: Arc::new(Mutex::new(HashMap::with_capacity(config.capacity_hint))),
-            last_port: Arc::new(Mutex::new(config.port_range_start)),
+            last_port: Arc::new(Mutex::new(Self::initial_cursor_for(&config))),
             socket_strategy,
         }
+    }
+
+    /// Where the allocation cursor starts: the first port of the range, or a
+    /// random port in it with [`PortAllocatorConfig::randomize_start_cursor`].
+    fn initial_cursor(&self) -> u16 {
+        Self::initial_cursor_for(&self.config)
+    }
+
+    fn initial_cursor_for(config: &PortAllocatorConfig) -> u16 {
+        let (start, end) = (config.port_range_start, config.port_range_end);
+        if !config.randomize_start_cursor || end <= start {
+            return start;
+        }
+        use rand::Rng;
+        rand::thread_rng().gen_range(start..=end)
     }
 
     /// Number of distinct candidate ports in this allocator's configured
@@ -790,7 +813,7 @@ impl PortAllocator {
                         .collect(),
                     allocated_ports: HashMap::with_capacity(self.config.capacity_hint),
                     quarantined_ports: HashMap::new(),
-                    last_port: self.config.port_range_start,
+                    last_port: self.initial_cursor(),
                 }));
                 registry.insert(key, Arc::downgrade(&pool));
                 pool
@@ -1562,7 +1585,49 @@ mod tests {
             allocation_retries: u32::from(port_range_end - port_range_start) + 1,
             validate_ports: false,
             capacity_hint: usize::from(port_range_end - port_range_start) + 1,
+            randomize_start_cursor: false,
         }
+    }
+
+    #[test]
+    fn randomized_start_cursor_varies_per_allocator_and_keeps_pairing_and_order() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            let mut first_ports = HashSet::new();
+            // Each range is its own shared pool, standing in for a fresh
+            // process: where its first call lands must not be fixed.
+            for index in 0..16u16 {
+                let start = 23_000 + index * 200;
+                let end = start + 99;
+                let mut config = indexed_test_config(start, end, PairingStrategy::Muxed, ip);
+                config.randomize_start_cursor = true;
+                let allocator = PortAllocator::with_config(config);
+                let (rtp, rtcp) = allocator
+                    .allocate_rtp_rtcp_pair(&format!("first-{index}"), Some(ip))
+                    .await
+                    .expect("pair");
+                assert_eq!(rtp.port() % 2, 0, "RTP stays even");
+                assert_eq!(rtcp.port(), rtp.port() + 1, "RTCP stays RTP + 1");
+                assert!((start..=end).contains(&rtp.port()) && rtcp.port() <= end);
+                first_ports.insert(rtp.port() - start);
+                // Sequential from there on.
+                let (next, _) = allocator
+                    .allocate_rtp_rtcp_pair(&format!("second-{index}"), Some(ip))
+                    .await
+                    .expect("second pair");
+                assert!(
+                    next.port() == rtp.port() + 2 || next.port() == start + (start % 2),
+                    "the cursor advances sequentially (or wraps): {} then {}",
+                    rtp.port(),
+                    next.port()
+                );
+            }
+            assert!(
+                first_ports.len() > 1,
+                "16 fresh allocators all started at the same offset: {first_ports:?}"
+            );
+        });
     }
 
     #[test]
@@ -1686,6 +1751,7 @@ mod tests {
                 allocation_retries: 200,
                 validate_ports: true,
                 capacity_hint: 0,
+                randomize_start_cursor: false,
             });
             let mut seen = HashSet::new();
             for index in 0..8 {
@@ -1730,6 +1796,7 @@ mod tests {
             allocation_retries: 20,
             validate_ports: false,
             capacity_hint: 0,
+            randomize_start_cursor: false,
         };
 
         let allocator = PortAllocator::with_config(config.clone());
@@ -1756,6 +1823,7 @@ mod tests {
                 allocation_retries: 20,
                 validate_ports: false,
                 capacity_hint: 128,
+                randomize_start_cursor: false,
             };
             let allocator = PortAllocator::with_config(config);
             let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -1795,6 +1863,7 @@ mod tests {
                 allocation_retries: 61,
                 validate_ports: false,
                 capacity_hint: 61,
+                randomize_start_cursor: false,
             };
             let allocator = PortAllocator::with_config(config);
             let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -1840,6 +1909,7 @@ mod tests {
                 allocation_retries: 3,
                 validate_ports: false,
                 capacity_hint: 3,
+                randomize_start_cursor: false,
             };
             let allocator = PortAllocator::with_config(config);
             let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -1876,6 +1946,7 @@ mod tests {
                 allocation_retries: 2,
                 validate_ports: false,
                 capacity_hint: 2,
+                randomize_start_cursor: false,
             });
             let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
@@ -1931,6 +2002,7 @@ mod tests {
                 allocation_retries: 2,
                 validate_ports: false,
                 capacity_hint: 2,
+                randomize_start_cursor: false,
             };
             let first_allocator = PortAllocator::with_config(config.clone());
             let second_allocator = PortAllocator::with_config(config.clone());
@@ -2213,6 +2285,7 @@ mod tests {
                 allocation_retries: 1_024,
                 validate_ports: false,
                 capacity_hint: ACTIVE_PER_ALLOCATOR,
+                randomize_start_cursor: false,
             };
             let first_allocator = Arc::new(PortAllocator::with_config(config.clone()));
             let second_allocator = Arc::new(PortAllocator::with_config(config));
@@ -2324,6 +2397,7 @@ mod tests {
                 allocation_retries: 2,
                 validate_ports: false,
                 capacity_hint: 2,
+                randomize_start_cursor: false,
             };
             let rejected_allocator = PortAllocator::with_config(config.clone());
             let retry_allocator = PortAllocator::with_config(config.clone());
@@ -2384,6 +2458,7 @@ mod tests {
                 allocation_retries: 1,
                 validate_ports: true,
                 capacity_hint: 1,
+                randomize_start_cursor: false,
             });
 
             let error = allocator

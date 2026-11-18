@@ -738,7 +738,7 @@ mod tests;
 // Re-export important types
 pub use audio_generation::{AudioSource, AudioTransmitterConfig};
 pub use bridge::{BridgeError, BridgeHandle, BridgeMode};
-pub use statistics::MediaDiagnostics;
+pub use statistics::{DtlsState, DtlsStatus, MediaDiagnostics};
 pub use types::{
     AdvancedProcessorConfig, AdvancedProcessorSet, MediaConfig, MediaSessionEvent,
     MediaSessionInfo, MediaSessionStatus, AMR_DTX_PARAMETER, NEGOTIATED_FMTP_PARAMETER,
@@ -1083,6 +1083,11 @@ pub struct MediaSessionController {
     /// relay bridges are identified by the absence of an entry (relay is the
     /// historical default and needs no guard bypass).
     pub(super) bridge_modes: Arc<DashMap<DialogId, bridge::BridgeMode>>,
+    /// Liveness of the bridge forwarder task reading from each dialog: true
+    /// while it runs, false once it exits or is aborted.
+    pub(super) bridge_forwarders: Arc<DashMap<DialogId, Arc<std::sync::atomic::AtomicBool>>>,
+    /// DTLS-SRTP handshake role and progress per dialog, for diagnostics.
+    pub(super) dtls_status: Arc<DashMap<DialogId, statistics::DtlsStatus>>,
 
     /// Sprint 3.6 C1 follow-up — RFC 3389 comfort-noise gate state per
     /// dialog. Lazily populated on first audio frame for sessions
@@ -1234,6 +1239,8 @@ impl MediaSessionController {
             rtp_bridge,
             bridge_partners: Arc::new(DashMap::with_capacity(capacity_hint)),
             bridge_modes: Arc::new(DashMap::with_capacity(capacity_hint)),
+            bridge_forwarders: Arc::new(DashMap::with_capacity(capacity_hint)),
+            dtls_status: Arc::new(DashMap::new()),
             cn_gate_state: Arc::new(DashMap::with_capacity(capacity_hint)),
             comfort_noise_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             media_directions: Arc::new(DashMap::with_capacity(capacity_hint)),
@@ -1442,6 +1449,9 @@ impl MediaSessionController {
         // the indexed unvalidated pool for every custom range so controllers
         // with the same bind domain share reservations before that bind.
         config.allocation_strategy = AllocationStrategy::Incremental;
+        // Not from the bottom of the range on every start: a restarted
+        // process must not hand its first calls its predecessor's ports.
+        config.randomize_start_cursor = true;
         config.prefer_port_reuse = false;
         config.allocation_retries = configured_port_range_len(base_port, max_port) as u32;
 
@@ -1530,6 +1540,8 @@ impl MediaSessionController {
         port_config.port_range_end = max_port;
         port_config.validate_ports = false;
         port_config.allocation_strategy = AllocationStrategy::Incremental;
+        // See `with_port_range`: no fixed starting port across restarts.
+        port_config.randomize_start_cursor = true;
         port_config.prefer_port_reuse = false;
         port_config.allocation_retries = configured_port_range_len(base_port, max_port) as u32;
         let port_allocator = Some(Arc::new(PortAllocator::with_config(port_config)));
@@ -1561,6 +1573,8 @@ impl MediaSessionController {
             rtp_bridge,
             bridge_partners: Arc::new(DashMap::new()),
             bridge_modes: Arc::new(DashMap::new()),
+            bridge_forwarders: Arc::new(DashMap::new()),
+            dtls_status: Arc::new(DashMap::new()),
             cn_gate_state: Arc::new(DashMap::new()),
             comfort_noise_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             media_directions: Arc::new(DashMap::new()),
@@ -1977,6 +1991,52 @@ impl MediaSessionController {
         srtp_profiles: Vec<rtp_core::dtls_srtp::SrtpProtectionProfile>,
         timeout: std::time::Duration,
     ) -> Result<rtp_core::dtls_srtp::DtlsSrtpHandshakeResult> {
+        let role_name = match role {
+            DtlsRole::Client => "client",
+            DtlsRole::Server => "server",
+        };
+        let status = |state| statistics::DtlsStatus {
+            role: role_name,
+            state,
+        };
+        self.dtls_status.insert(
+            dialog_id.clone(),
+            status(statistics::DtlsState::Handshaking),
+        );
+        let result = self
+            .run_dtls_handshake_and_install_inner(
+                dialog_id,
+                identity,
+                role,
+                remote_addr,
+                expected_remote_fingerprint_sha256,
+                srtp_profiles,
+                timeout,
+            )
+            .await;
+        // Only the dialog's current entry is updated: a stopped dialog's
+        // side state is gone and must not be recreated.
+        if let Some(mut entry) = self.dtls_status.get_mut(dialog_id) {
+            *entry = status(match &result {
+                Ok(_) => statistics::DtlsState::Connected,
+                Err(_) => statistics::DtlsState::Failed,
+            });
+        }
+        result
+    }
+
+    #[cfg(feature = "dtls-srtp")]
+    #[allow(clippy::too_many_arguments)]
+    async fn run_dtls_handshake_and_install_inner(
+        &self,
+        dialog_id: &DialogId,
+        identity: rtp_core::dtls_srtp::DtlsIdentity,
+        role: DtlsRole,
+        remote_addr: std::net::SocketAddr,
+        expected_remote_fingerprint_sha256: [u8; 32],
+        srtp_profiles: Vec<rtp_core::dtls_srtp::SrtpProtectionProfile>,
+        timeout: std::time::Duration,
+    ) -> Result<rtp_core::dtls_srtp::DtlsSrtpHandshakeResult> {
         let session_arc = self
             .rtp_sessions
             .get(dialog_id)
@@ -2061,6 +2121,8 @@ impl MediaSessionController {
         self.dtmf_callbacks.remove(dialog_id);
         self.cn_gate_state.remove(dialog_id);
         self.codec_runtimes.remove(dialog_id);
+        self.bridge_forwarders.remove(dialog_id);
+        self.dtls_status.remove(dialog_id);
 
         let media_id = MediaSessionId::from_dialog(dialog_id);
         if let Some((_, session_id)) = self.media_to_session.remove(&media_id) {

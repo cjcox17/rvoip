@@ -17,7 +17,7 @@ pub use crate::types::DialogId;
 #[cfg(feature = "dtls-srtp")]
 pub use controller::DtlsRole;
 pub use controller::{
-    DtmfNotification, MediaConfig, MediaDiagnostics, MediaSessionController,
+    DtlsState, DtlsStatus, DtmfNotification, MediaConfig, MediaDiagnostics, MediaSessionController,
     MediaSessionControllerConfig, MediaSessionEvent, MediaSessionInfo, MediaSessionStatus,
 };
 

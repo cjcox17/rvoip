@@ -293,6 +293,7 @@ mod tests {
             allocation_retries: 1,
             validate_ports: false,
             capacity_hint: 1,
+            randomize_start_cursor: false,
         }));
         let session_id = "cancelled-dialog".to_string();
         allocator

@@ -15,6 +15,27 @@ use rvoip_rtp_core::session::{RtpSessionStats, RtpStreamStats};
 
 use super::{MediaSessionController, MediaSessionEvent};
 
+/// Progress of a dialog's DTLS-SRTP handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtlsState {
+    /// The handshake is running.
+    Handshaking,
+    /// The handshake completed and SRTP keys are installed.
+    Connected,
+    /// The handshake failed, timed out, or the peer's fingerprint did not
+    /// match.
+    Failed,
+}
+
+/// A dialog's DTLS role (`client` | `server`) and handshake progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DtlsStatus {
+    /// `client` (sent ClientHello) or `server`.
+    pub role: &'static str,
+    /// Handshake progress.
+    pub state: DtlsState,
+}
+
 /// A snapshot of one dialog's media plumbing, for diagnosing a leg that
 /// carries no audio: where the socket is, where it sends, what the receive
 /// loop did with what arrived, and whether it is bridged.
@@ -23,8 +44,10 @@ use super::{MediaSessionController, MediaSessionEvent};
 /// carried); no SSRC, key material or payload is.
 #[derive(Clone, Debug)]
 pub struct MediaDiagnostics {
-    /// Local RTP socket address.
+    /// Local RTP socket address (bound address and port).
     pub local_addr: Option<std::net::SocketAddr>,
+    /// Local address of the separate RTCP socket (non-mux legs only).
+    pub local_rtcp_addr: Option<std::net::SocketAddr>,
     /// The peer's signalled RTP address (SDP or ICE).
     pub signalled_remote_addr: Option<std::net::SocketAddr>,
     /// Where RTP is sent now (signalled, or learned by symmetric RTP).
@@ -51,6 +74,11 @@ pub struct MediaDiagnostics {
     pub bridged_to: Option<DialogId>,
     /// Whether that bridge transcodes.
     pub bridge_transcodes: bool,
+    /// Whether the bridge forwarder reading from this dialog is running;
+    /// `None` when no bridge was ever started from it.
+    pub bridge_forwarder_alive: Option<bool>,
+    /// DTLS-SRTP role and handshake progress; `None` without DTLS.
+    pub dtls: Option<DtlsStatus>,
     /// The negotiated codec.
     pub codec: Option<String>,
 }
@@ -79,12 +107,14 @@ impl MediaSessionController {
             ),
             None => (None, None, false, false, false),
         };
+        let local_rtcp_addr = udp.and_then(|udp| udp.local_rtcp_socket_addr());
         let receive = udp.map(|udp| udp.receive_diagnostics()).unwrap_or_default();
         let symmetric_rtp = udp
             .map(|udp| udp.symmetric_rtp_diagnostics())
             .unwrap_or_default();
         Some(MediaDiagnostics {
             local_addr,
+            local_rtcp_addr,
             signalled_remote_addr,
             current_remote_addr,
             secure_media_required: secure,
@@ -101,6 +131,14 @@ impl MediaSessionController {
                 .bridge_modes
                 .get(dialog_id)
                 .is_some_and(|mode| *mode.value() == super::BridgeMode::Transcode),
+            bridge_forwarder_alive: self
+                .bridge_forwarders
+                .get(dialog_id)
+                .map(|alive| alive.load(std::sync::atomic::Ordering::Acquire)),
+            dtls: self
+                .dtls_status
+                .get(dialog_id)
+                .map(|status| *status.value()),
             codec: self
                 .sessions
                 .get(dialog_id)
