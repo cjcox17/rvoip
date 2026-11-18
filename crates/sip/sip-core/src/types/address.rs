@@ -143,8 +143,11 @@ pub fn needs_quoting(display_name: &str) -> bool {
     display_name.chars().any(|c| {
         // A space requires quoting
         c == ' ' ||
-        // Any non-alphanumeric character that's not in the token character set requires quoting
-        (!c.is_alphanumeric() && !matches!(c, '-' | '.' | '!' | '%' | '*' | '_' | '+' | '`' | '\'' | '~'))
+        // Anything outside the RFC 3261 token set requires quoting. The token
+        // set is ASCII only: a non-ASCII letter (UTF-8 is allowed in a
+        // quoted-string, not in a token) must be quoted, or strict parsers
+        // such as SIP.js reject the header.
+        (!c.is_ascii_alphanumeric() && !matches!(c, '-' | '.' | '!' | '%' | '*' | '_' | '+' | '`' | '\'' | '~'))
     }) || display_name.contains('"') || display_name.contains('\\')
 }
 
@@ -155,7 +158,8 @@ impl fmt::Display for Address {
             let trimmed_name = name.trim();
             if !trimmed_name.is_empty() {
                 if needs_quoting(trimmed_name) {
-                    write!(f, "\"{}\"", name.replace("\"", "\\\""))?;
+                    // quoted-pair escapes for `\` and `"` (RFC 3261 §25.1).
+                    write!(f, "\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))?;
                 } else {
                     write!(f, "{}", trimmed_name)?;
                 }
@@ -885,5 +889,34 @@ mod diagnostic_tests {
         assert!(debug.contains("uri_scheme: \"sip\""));
         assert_eq!(address.to_string(), wire);
         assert!(serde_json::to_string(&address).unwrap().contains(CANARY));
+    }
+}
+
+#[cfg(test)]
+mod display_name_quoting_tests {
+    use super::*;
+
+    #[test]
+    fn a_non_ascii_display_name_is_always_quoted() {
+        // Unicode letters are not RFC 3261 token characters: an unquoted
+        // `José <sip:…>` is rejected by strict parsers (SIP.js).
+        assert!(needs_quoting("José"));
+        assert!(needs_quoting("Zoë"));
+        assert!(!needs_quoting("Jose"));
+        let uri = Uri::from_str("sip:1005@tenant.example").unwrap();
+        let address = Address::new_with_display_name("José", uri);
+        assert_eq!(address.to_string(), "\"José\" <sip:1005@tenant.example>");
+        let parsed = Address::from_str(&address.to_string()).expect("round trip");
+        assert_eq!(parsed.display_name.as_deref(), Some("José"));
+    }
+
+    #[test]
+    fn a_quoted_display_name_escapes_backslash_and_quote() {
+        let uri = Uri::from_str("sip:1005@tenant.example").unwrap();
+        let address = Address::new_with_display_name("a\\b\"c", uri);
+        assert_eq!(
+            address.to_string(),
+            "\"a\\\\b\\\"c\" <sip:1005@tenant.example>"
+        );
     }
 }

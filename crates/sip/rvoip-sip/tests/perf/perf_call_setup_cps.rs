@@ -243,9 +243,8 @@ fn classify_bye_failure(error: &rvoip_sip::SessionError) -> (&'static str, &'sta
         {
             ("confirmation_unobservable", "confirmation")
         }
-        SessionError::DialogError(detail) if detail == "SIP BYE failed (class=dialog-dispatch)" => {
-            ("dialog_dispatch_failed", "dispatch")
-        }
+        // Only the BYE dispatch produces this variant.
+        SessionError::DialogDispatch { .. } => ("dialog_dispatch_failed", "dispatch"),
         SessionError::ProtocolError(detail)
             if detail == "SIP BYE received a non-success final response" =>
         {

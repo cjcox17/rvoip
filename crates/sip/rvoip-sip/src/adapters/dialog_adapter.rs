@@ -1293,6 +1293,19 @@ fn redacted_invite_dispatch_error<E>(failure: InviteDispatchFailure, _source: E)
     SessionError::DialogError(failure.diagnostic().to_string())
 }
 
+/// A dialog-layer refusal to send an in-dialog request, keeping only the
+/// operation and the dialog layer's fixed-vocabulary cause
+/// ([`rvoip_sip_dialog::api::ApiError::failure_cause`]).
+fn dialog_dispatch_error(
+    operation: &'static str,
+    source: &rvoip_sip_dialog::api::ApiError,
+) -> SessionError {
+    SessionError::DialogDispatch {
+        operation,
+        cause: source.failure_cause(),
+    }
+}
+
 fn redacted_dialog_operation_error<E>(operation: &'static str, _source: E) -> SessionError {
     SessionError::DialogError(format!("{operation} failed (class=dialog-dispatch)"))
 }
@@ -3890,7 +3903,7 @@ impl DialogAdapter {
             .dialog_api
             .send_bye_with_options_and_completion(dialog_id, opts)
             .await
-            .map_err(|error| redacted_dialog_operation_error("SIP BYE", error))?;
+            .map_err(|error| dialog_dispatch_error("SIP BYE", &error))?;
         self.retain_outgoing_bye_transaction(
             handle,
             generation,
