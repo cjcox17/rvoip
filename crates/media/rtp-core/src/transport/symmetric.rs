@@ -141,6 +141,8 @@ pub(crate) struct SymmetricRtpLearner {
     /// The peer's signalled RTP address (SDP or ICE) and when it was
     /// signalled, when known.
     signalled: Option<(SocketAddr, Instant)>,
+    /// Whether this signalled window already spent its one reclaim.
+    reclaimed: bool,
     latched: Option<LatchedSource>,
     candidate: Option<RebindCandidate>,
     rebindings: u8,
@@ -151,6 +153,7 @@ impl SymmetricRtpLearner {
         Self {
             policy,
             signalled: None,
+            reclaimed: false,
             latched: None,
             candidate: None,
             rebindings: 0,
@@ -161,6 +164,7 @@ impl SymmetricRtpLearner {
         self.latched = None;
         self.candidate = None;
         self.rebindings = 0;
+        self.reclaimed = false;
     }
 
     /// Record the address the peer signalled (SDP connection address or the
@@ -168,12 +172,27 @@ impl SymmetricRtpLearner {
     /// source.
     pub(crate) fn set_signalled(&mut self, signalled: Option<(SocketAddr, Instant)>) {
         self.signalled = signalled;
+        self.reclaimed = false;
+    }
+
+    /// Drop the candidate in probation unless it is a reclaim by the
+    /// signalled peer: packets from a third, rejected source must not be
+    /// able to cancel that.
+    fn clear_learned_candidate(&mut self) {
+        if !self.candidate.is_some_and(|candidate| candidate.reclaim) {
+            self.candidate = None;
+        }
+    }
+
+    fn reclaim_in_progress(&self) -> bool {
+        self.candidate.is_some_and(|candidate| candidate.reclaim)
     }
 
     /// Whether a packet from `source` may start or continue a reclaim.
     fn may_reclaim(&self, source: SocketAddr, now: Instant) -> bool {
         self.signalled.is_some_and(|(address, since)| {
             address == source
+                && !self.reclaimed
                 && now.saturating_duration_since(since) <= SIGNALLED_RECLAIM_WINDOW
                 && self.rebindings < self.policy.max_rebindings
         })
@@ -218,6 +237,9 @@ impl SymmetricRtpLearner {
             },
         };
         if candidate.packets >= self.policy.probation_packets {
+            // One reclaim per signalled window: a spoofer cannot win it back
+            // and forth within the window.
+            self.reclaimed = true;
             self.accept_candidate(candidate);
             SymmetricRtpDecision::Rebind
         } else {
@@ -256,9 +278,7 @@ impl SymmetricRtpLearner {
             // A reclaim by the signalled peer is not cancelled by the source
             // it is reclaiming from: that source may be a stale stream that
             // never stops.
-            if !self.candidate.is_some_and(|candidate| candidate.reclaim) {
-                self.candidate = None;
-            }
+            self.clear_learned_candidate();
             return SymmetricRtpDecision::Accept;
         }
 
@@ -270,7 +290,7 @@ impl SymmetricRtpLearner {
             || (!self.policy.allow_ip_change && source.ip() != latched.address.ip())
             || ssrc != latched.ssrc
         {
-            self.candidate = None;
+            self.clear_learned_candidate();
             return SymmetricRtpDecision::Reject;
         }
 
@@ -286,7 +306,12 @@ impl SymmetricRtpLearner {
             _ => {
                 let delta = sequence.wrapping_sub(latched.last_sequence);
                 if delta == 0 || delta > self.policy.max_sequence_jump {
-                    self.candidate = None;
+                    self.clear_learned_candidate();
+                    return SymmetricRtpDecision::Reject;
+                }
+                if self.reclaim_in_progress() {
+                    // The signalled peer's reclaim keeps its slot; a learned
+                    // move waits until it completes or lapses.
                     return SymmetricRtpDecision::Reject;
                 }
                 let candidate = RebindCandidate {
@@ -571,11 +596,97 @@ mod tests {
             learner.observe(other_port, 7, 103, now),
             SymmetricRtpDecision::Reject
         );
-        // And a second reclaim window does not reopen it.
+        // The budget is per learner generation: `set_remote_rtp_addr` (every
+        // re-INVITE or ICE retarget) bumps the transport's generation and the
+        // receive loop resets the learner, so a new signalled address starts
+        // with a fresh budget and window, as the transport does it.
+        learner.reset();
         learner.set_signalled(Some((other_port, now)));
+        assert_eq!(learner.rebindings, 0);
         assert_eq!(
-            learner.observe(other_port, 7, 104, now),
+            learner.observe(stale, 99, 5_001, now),
+            SymmetricRtpDecision::LatchInitial
+        );
+        for sequence in 104..106 {
+            assert_eq!(
+                learner.observe(other_port, 7, sequence, now),
+                SymmetricRtpDecision::Probation
+            );
+        }
+        assert_eq!(
+            learner.observe(other_port, 7, 106, now),
+            SymmetricRtpDecision::Rebind
+        );
+    }
+
+    #[test]
+    fn only_one_reclaim_per_signalled_window() {
+        let now = Instant::now();
+        // A generous budget, so only the one-per-window rule can refuse.
+        let policy = SymmetricRtpPolicy {
+            max_rebindings: 8,
+            ..SymmetricRtpPolicy::default()
+        };
+        let mut learner = SymmetricRtpLearner::new(policy);
+        let signalled = addr(SIGNALLED, 44_276);
+        learner.set_signalled(Some((signalled, now)));
+        let stale = addr(SIGNALLED, 51_000);
+        learner.observe(stale, 99, 5_000, now);
+        for sequence in 100..103 {
+            learner.observe(signalled, 7, sequence, now);
+        }
+        assert_eq!(learner.rebindings, 1);
+        // Something else learns the latch away (same IP, same SSRC)...
+        let elsewhere = addr(SIGNALLED, 52_000);
+        for sequence in 103..106 {
+            learner.observe(elsewhere, 7, sequence, now);
+        }
+        assert_eq!(learner.rebindings, 2);
+        // ...and a stream from the signalled address with another SSRC
+        // cannot reclaim again inside the same window.
+        for sequence in 200..210 {
+            assert_ne!(
+                learner.observe(signalled, 8, sequence, now),
+                SymmetricRtpDecision::Rebind,
+                "a second reclaim in one window must not be granted"
+            );
+        }
+        assert_eq!(learner.rebindings, 2);
+    }
+
+    #[test]
+    fn a_rejected_third_source_does_not_cancel_a_reclaim() {
+        let now = Instant::now();
+        let stale = addr(SIGNALLED, 51_000);
+        let (mut learner, signalled) = latched_to_stale(now, stale);
+        let third = addr([198, 51, 100, 77], 9_000);
+        assert_eq!(
+            learner.observe(signalled, 7, 100, now),
+            SymmetricRtpDecision::Probation
+        );
+        // Another IP: rejected, and the reclaim survives.
+        assert_eq!(
+            learner.observe(third, 99, 5_001, now),
             SymmetricRtpDecision::Reject
+        );
+        // Same IP, same SSRC as the latch, far sequence jump: rejected too.
+        assert_eq!(
+            learner.observe(addr(SIGNALLED, 53_000), 99, 40_000, now),
+            SymmetricRtpDecision::Reject
+        );
+        // Same IP, same SSRC, in sequence: would start a learned move, but
+        // the reclaim keeps its slot.
+        assert_eq!(
+            learner.observe(addr(SIGNALLED, 53_000), 99, 5_002, now),
+            SymmetricRtpDecision::Reject
+        );
+        assert_eq!(
+            learner.observe(signalled, 7, 101, now),
+            SymmetricRtpDecision::Probation
+        );
+        assert_eq!(
+            learner.observe(signalled, 7, 102, now),
+            SymmetricRtpDecision::Rebind
         );
     }
 

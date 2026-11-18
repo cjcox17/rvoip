@@ -576,15 +576,18 @@ impl PortAllocator {
 
         let start = self.config.port_range_start;
         let end = self.config.port_range_end;
-        let first_even = start + (start % 2);
+        // `start` may be 65535 (odd): no even port is left above it.
+        let first_even = start.checked_add(start % 2).unwrap_or(u16::MAX);
         // Even ports whose odd neighbour is still in range.
         let pair_count = if first_even >= end {
             0
         } else {
             usize::from((end - first_even - 1) / 2) + 1
         };
-        let cursor = pool.last_port.clamp(first_even, end);
-        let mut candidate = (cursor + (cursor % 2)).min(end);
+        let cursor = pool.last_port.clamp(first_even.min(end), end);
+        // A cursor on 65535 cannot round up to an even port; it saturates
+        // and the loop below wraps it to `first_even`.
+        let mut candidate = cursor.saturating_add(cursor % 2).min(end);
         let mut process_conflicts = 0usize;
         for _ in 0..pair_count {
             if candidate >= end || candidate < first_even {
@@ -1363,7 +1366,7 @@ impl PortAllocator {
         let port = *last_port;
 
         // Update last port
-        *last_port = if port + 1 > self.config.port_range_end {
+        *last_port = if port >= self.config.port_range_end {
             self.config.port_range_start
         } else {
             port + 1
@@ -1380,7 +1383,7 @@ impl PortAllocator {
         let port = *last_port;
 
         // Update last port
-        *last_port = if port + 1 > self.config.port_range_end {
+        *last_port = if port >= self.config.port_range_end {
             self.config.port_range_start
         } else {
             port + 1
@@ -1587,6 +1590,52 @@ mod tests {
             capacity_hint: usize::from(port_range_end - port_range_start) + 1,
             randomize_start_cursor: false,
         }
+    }
+
+    #[test]
+    fn a_range_ending_at_65535_never_overflows_from_any_cursor() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            // Every start, including a cursor landing on 65535 itself.
+            for start in [65_526u16, 65_527] {
+                let mut config = indexed_test_config(start, u16::MAX, PairingStrategy::Muxed, ip);
+                config.randomize_start_cursor = true;
+                for round in 0..20 {
+                    let allocator = PortAllocator::with_config(config.clone());
+                    let mut ports = Vec::new();
+                    for index in 0..3 {
+                        let (rtp, rtcp) = allocator
+                            .allocate_rtp_rtcp_pair(
+                                &format!("hi-{start}-{round}-{index}"),
+                                Some(ip),
+                            )
+                            .await
+                            .expect("pair below 65535");
+                        assert_eq!(rtp.port() % 2, 0);
+                        assert_eq!(rtcp.port(), rtp.port() + 1);
+                        ports.push(rtp.port());
+                    }
+                    let single = allocator
+                        .allocate_port_pair(&format!("hi-single-{start}-{round}"), Some(ip))
+                        .await
+                        .expect("single port")
+                        .0
+                        .port();
+                    assert!(single >= start);
+                    drop(allocator);
+                    let _ = ports;
+                }
+            }
+            // A one-port range at the very top holds no pair and must fail
+            // cleanly rather than overflow.
+            let config = indexed_test_config(u16::MAX, u16::MAX, PairingStrategy::Muxed, ip);
+            let allocator = PortAllocator::with_config(config);
+            assert!(allocator
+                .allocate_rtp_rtcp_pair("top-pair", Some(ip))
+                .await
+                .is_err());
+        });
     }
 
     #[test]
