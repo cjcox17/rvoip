@@ -12032,6 +12032,19 @@ impl UnifiedCoordinator {
         self.media_adapter.media_quality_exact(handle).await
     }
 
+    /// Snapshot one call's media plumbing for diagnosis; see
+    /// [`crate::MediaDiagnostics`]. `None` when the call has no media session.
+    pub async fn media_diagnostics(&self, session: &SessionId) -> Option<crate::MediaDiagnostics> {
+        self.media_adapter.media_diagnostics(session).await
+    }
+
+    pub(crate) async fn media_diagnostics_exact(
+        &self,
+        handle: &SessionRegistryHandle,
+    ) -> Option<crate::MediaDiagnostics> {
+        self.media_adapter.media_diagnostics_exact(handle).await
+    }
+
     /// The codec mode of the last speech frame decoded from `session`'s peer,
     /// or `None` when there is no media or the codec tracks no mode. For AMR
     /// this is how a caller sees whether a

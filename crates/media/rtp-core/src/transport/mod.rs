@@ -161,7 +161,10 @@ pub use allocator::{
 pub use security_transport::SecurityRtpTransport;
 pub use symmetric::{SymmetricRtpDiagnostics, SymmetricRtpPolicy};
 pub use tcp::TcpRtpTransport;
-pub use udp::{set_diagnostics as set_udp_diagnostics, SrtpContextRollback, UdpRtpTransport};
+pub use udp::{
+    set_diagnostics as set_udp_diagnostics, SrtpContextRollback, TransportReceiveDiagnostics,
+    UdpRtpTransport,
+};
 pub use validation::{PlatformSocketStrategy, PlatformType, RtpSocketValidator};
 
 #[cfg(test)]

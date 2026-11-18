@@ -182,7 +182,30 @@ impl Drop for BridgeHandle {
     }
 }
 
+/// Clears a forwarder's liveness flag when its task ends or is aborted.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Run `future` with `alive` set for as long as it runs.
+async fn while_alive<F: std::future::Future<Output = ()>>(alive: Arc<AtomicBool>, future: F) {
+    let _guard = AliveGuard(alive);
+    future.await;
+}
+
 impl MediaSessionController {
+    /// A fresh liveness flag (set) for the forwarder reading from `dialog`.
+    fn forwarder_alive_flag(&self, dialog: &DialogId) -> Arc<AtomicBool> {
+        let alive = Arc::new(AtomicBool::new(true));
+        self.bridge_forwarders
+            .insert(dialog.clone(), Arc::clone(&alive));
+        alive
+    }
+
     /// Bridge two existing media sessions at the RTP packet level.
     ///
     /// Both sessions must be ready (have a remote address) and must have
@@ -326,44 +349,60 @@ impl MediaSessionController {
             guard.send_handle()
         };
 
+        // Each forwarder flags its liveness under the dialog it reads from,
+        // so diagnostics can tell a dead forwarder from a silent peer.
+        let alive_ab = self.forwarder_alive_flag(&a);
+        let alive_ba = self.forwarder_alive_flag(&b);
         let tasks = match mode {
             BridgeMode::Relay => {
-                let task_ab = tokio::spawn(forward_rtp(
-                    a.clone(),
-                    b.clone(),
-                    a_subscriber,
-                    b_session_arc.clone(),
-                    b_send_handle,
-                    cancel.clone(),
+                let task_ab = tokio::spawn(while_alive(
+                    alive_ab,
+                    forward_rtp(
+                        a.clone(),
+                        b.clone(),
+                        a_subscriber,
+                        b_session_arc.clone(),
+                        b_send_handle,
+                        cancel.clone(),
+                    ),
                 ));
-                let task_ba = tokio::spawn(forward_rtp(
-                    b.clone(),
-                    a.clone(),
-                    b_subscriber,
-                    a_session_arc.clone(),
-                    a_send_handle,
-                    cancel.clone(),
+                let task_ba = tokio::spawn(while_alive(
+                    alive_ba,
+                    forward_rtp(
+                        b.clone(),
+                        a.clone(),
+                        b_subscriber,
+                        a_session_arc.clone(),
+                        a_send_handle,
+                        cancel.clone(),
+                    ),
                 ));
                 vec![task_ab, task_ba]
             }
             BridgeMode::Transcode => {
-                let task_ab = tokio::spawn(forward_rtp_transcode(
-                    a.clone(),
-                    b.clone(),
-                    a_subscriber,
-                    b_send_handle,
-                    b_session_arc.clone(),
-                    Arc::clone(&self.codec_runtimes),
-                    cancel.clone(),
+                let task_ab = tokio::spawn(while_alive(
+                    alive_ab,
+                    forward_rtp_transcode(
+                        a.clone(),
+                        b.clone(),
+                        a_subscriber,
+                        b_send_handle,
+                        b_session_arc.clone(),
+                        Arc::clone(&self.codec_runtimes),
+                        cancel.clone(),
+                    ),
                 ));
-                let task_ba = tokio::spawn(forward_rtp_transcode(
-                    b.clone(),
-                    a.clone(),
-                    b_subscriber,
-                    a_send_handle,
-                    a_session_arc.clone(),
-                    Arc::clone(&self.codec_runtimes),
-                    cancel.clone(),
+                let task_ba = tokio::spawn(while_alive(
+                    alive_ba,
+                    forward_rtp_transcode(
+                        b.clone(),
+                        a.clone(),
+                        b_subscriber,
+                        a_send_handle,
+                        a_session_arc.clone(),
+                        Arc::clone(&self.codec_runtimes),
+                        cancel.clone(),
+                    ),
                 ));
                 vec![task_ab, task_ba]
             }
@@ -1181,6 +1220,43 @@ mod tests {
         // immediately, not on task completion.
         assert!(!controller.is_bridged(&a));
         assert!(!controller.is_bridged(&b));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_report_forwarder_liveness_and_the_bound_socket() {
+        let controller = MediaSessionController::new();
+        let a = DialogId::new("diag-a");
+        let b = DialogId::new("diag-b");
+        for id in [&a, &b] {
+            controller
+                .start_media(id.clone(), test_config("PCMU"))
+                .await
+                .unwrap();
+        }
+        let before = controller.media_diagnostics(&a).await.expect("diagnostics");
+        assert_eq!(before.bridge_forwarder_alive, None);
+        assert!(before.local_addr.is_some_and(|addr| addr.port() != 0));
+        assert!(before.transport_receiving && before.session_receiving);
+        assert!(before.dtls.is_none());
+
+        let handle = expect_ok(controller.bridge_sessions(a.clone(), b.clone()).await);
+        let during = controller.media_diagnostics(&a).await.expect("diagnostics");
+        assert_eq!(during.bridge_forwarder_alive, Some(true));
+        assert_eq!(during.bridged_to.as_ref(), Some(&b));
+
+        drop(handle);
+        let mut alive = Some(true);
+        for _ in 0..100 {
+            alive = controller
+                .media_diagnostics(&a)
+                .await
+                .and_then(|diagnostics| diagnostics.bridge_forwarder_alive);
+            if alive == Some(false) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(alive, Some(false), "an aborted forwarder reads as dead");
     }
 
     /// A re-INVITE that flips the framing on one leg of a live bridge is
