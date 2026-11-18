@@ -152,6 +152,19 @@ pub enum SessionError {
     #[error("Dialog error: {}", TextDiagnostic(.0))]
     DialogError(String),
 
+    /// The dialog layer refused or failed to put an in-dialog request on the
+    /// wire. Both fields are fixed vocabulary (the operation, and the
+    /// dialog-layer cause such as `dialog-not-found`, `routing` or
+    /// `transaction`), so the error is shown unredacted and an operator can
+    /// tell why a BYE never left without a packet capture.
+    #[error("{operation} failed (class=dialog-dispatch, cause={cause})")]
+    DialogDispatch {
+        /// The operation, e.g. `SIP BYE`.
+        operation: &'static str,
+        /// Fixed dialog-layer cause ([`rvoip_sip_dialog::api::ApiError::failure_cause`]).
+        cause: &'static str,
+    },
+
     /// An error originating in the media layer (`rvoip-media-core`).
     #[error("Media error: {}", TextDiagnostic(.0))]
     MediaError(String),
@@ -345,6 +358,11 @@ impl fmt::Debug for SessionError {
             Self::DialogError(value) => formatter
                 .debug_tuple("DialogError")
                 .field(&TextDiagnostic(value))
+                .finish(),
+            Self::DialogDispatch { operation, cause } => formatter
+                .debug_struct("DialogDispatch")
+                .field("operation", operation)
+                .field("cause", cause)
                 .finish(),
             Self::MediaError(value) => formatter
                 .debug_tuple("MediaError")
@@ -972,5 +990,25 @@ mod erased_error_boundary_tests {
             as Box<dyn std::error::Error + Send + Sync>)
             .into();
         assert!(matches!(error, SessionError::SessionNotFound(ref id) if id == "call-1"));
+    }
+}
+
+#[cfg(test)]
+mod dialog_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn dialog_dispatch_shows_its_fixed_operation_and_cause() {
+        let error = SessionError::DialogDispatch {
+            operation: "SIP BYE",
+            cause: "routing",
+        };
+        assert_eq!(
+            error.to_string(),
+            "SIP BYE failed (class=dialog-dispatch, cause=routing)"
+        );
+        let debug = format!("{error:?}");
+        assert!(debug.contains("routing"), "{debug}");
+        assert!(!error.is_session_gone());
     }
 }

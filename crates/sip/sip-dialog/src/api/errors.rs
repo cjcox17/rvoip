@@ -256,6 +256,30 @@ impl ApiError {
         }
     }
 
+    /// Fixed-vocabulary cause of this error, finer than
+    /// [`Self::diagnostic_class`] when the error came from a dialog-layer
+    /// failure (`From<DialogError>`): `dialog-not-found`,
+    /// `invalid-dialog-state`, `routing`, `transaction`, `timeout`, ...
+    ///
+    /// Never echoes the message: an unrecognized message yields the coarse
+    /// class. Safe to log and to put in metrics.
+    pub fn failure_cause(&self) -> &'static str {
+        match self.message() {
+            "Invalid configuration" => "configuration",
+            "Network operation failed" => "network",
+            "SIP protocol operation failed" => "protocol",
+            "SIP routing operation failed" => "routing",
+            "Dialog not found" => "dialog-not-found",
+            "Invalid dialog state" => "invalid-dialog-state",
+            "Dialog already exists" => "dialog-already-exists",
+            "Transaction operation failed" => "transaction",
+            "SDP operation failed" => "sdp",
+            "Internal operation failed" => "internal",
+            "Operation timed out" => "timeout",
+            _ => self.diagnostic_class(),
+        }
+    }
+
     fn message(&self) -> &str {
         match self {
             Self::Configuration { message }
@@ -482,5 +506,43 @@ mod tests {
             ApiError::Configuration { message } => assert!(message.contains("Invalid address")),
             _ => panic!("Expected configuration error"),
         }
+    }
+
+    #[test]
+    fn failure_cause_names_each_dialog_layer_failure_without_its_detail() {
+        use crate::errors::DialogError;
+        let secret = "sip:alice@secret.invalid";
+        let cases = [
+            (DialogError::dialog_not_found(secret), "dialog-not-found"),
+            (
+                DialogError::InvalidState {
+                    expected: secret.to_string(),
+                    actual: secret.to_string(),
+                },
+                "invalid-dialog-state",
+            ),
+            (DialogError::routing_error(secret), "routing"),
+            (DialogError::protocol_error(secret), "protocol"),
+            (
+                DialogError::TransactionError {
+                    message: secret.to_string(),
+                },
+                "transaction",
+            ),
+            (
+                DialogError::TimeoutError {
+                    operation: secret.to_string(),
+                },
+                "timeout",
+            ),
+        ];
+        for (error, cause) in cases {
+            let api: ApiError = error.into();
+            assert_eq!(api.failure_cause(), cause);
+            assert!(!api.failure_cause().contains("secret"));
+        }
+        // An error built from free text keeps only its coarse class.
+        assert_eq!(ApiError::protocol(secret).failure_cause(), "protocol");
+        assert_eq!(ApiError::internal(secret).failure_cause(), "internal");
     }
 }
