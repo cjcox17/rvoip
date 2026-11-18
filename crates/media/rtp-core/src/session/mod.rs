@@ -1944,6 +1944,14 @@ impl RtpSession {
         self.transport.clone()
     }
 
+    /// Whether the task that turns transport events into session packets is
+    /// still running (it ends only when the session is closed).
+    pub fn is_receiving(&self) -> bool {
+        self.recv_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
     /// Close the session and clean up resources
     pub async fn close(&mut self) -> Result<()> {
         // Send BYE packet if we have a remote address. Like periodic reports

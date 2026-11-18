@@ -1491,6 +1491,17 @@ impl SessionHandle {
         }
     }
 
+    /// Snapshot this call's media plumbing (socket, signalled and current
+    /// peer address, SRTP state, receive-loop and symmetric-RTP counters,
+    /// bridge partner) for diagnosing a leg that carries no audio. `None`
+    /// when the call has no media session.
+    pub async fn media_diagnostics(&self) -> Option<crate::MediaDiagnostics> {
+        match &self.lifecycle_handle {
+            Some(handle) => self.coordinator.media_diagnostics_exact(handle).await,
+            None => self.coordinator.media_diagnostics(&self.call_id).await,
+        }
+    }
+
     /// Get the current event-bus-backed lifecycle snapshot for this call.
     ///
     /// This is a typed inspection view used by the wait helpers. It combines

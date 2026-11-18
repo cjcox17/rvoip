@@ -6,6 +6,17 @@
 //! a short same-SSRC/sequence probation and the number of moves is bounded.
 //! This does not replace SRTP authentication, but it prevents a single spoofed
 //! UDP packet from redirecting an established plain-RTP call.
+//!
+//! The peer's signalled address (SDP, or the ICE-nominated pair) outranks a
+//! learned one. Media ports are reused: a call can be handed a port that a
+//! previous call — possibly in a previous process, whose peer has not noticed
+//! yet — is still receiving a stream on. If that stale stream's first packet
+//! wins the initial latch, the new call's own peer (sending from exactly the
+//! address it signalled) is starved: a different IP is rejected outright, and
+//! a same-IP candidate never finishes probation because every stale packet
+//! from the latched source cancels it. So a packet from the signalled address
+//! always takes the latch back. A peer behind NAT never sends from its
+//! signalled address, so learning for it is unchanged.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -113,6 +124,8 @@ struct RebindCandidate {
 
 pub(crate) struct SymmetricRtpLearner {
     policy: SymmetricRtpPolicy,
+    /// The peer's signalled RTP address (SDP or ICE), when known.
+    signalled: Option<SocketAddr>,
     latched: Option<LatchedSource>,
     candidate: Option<RebindCandidate>,
     rebindings: u8,
@@ -122,6 +135,7 @@ impl SymmetricRtpLearner {
     pub(crate) fn new(policy: SymmetricRtpPolicy) -> Self {
         Self {
             policy,
+            signalled: None,
             latched: None,
             candidate: None,
             rebindings: 0,
@@ -132,6 +146,13 @@ impl SymmetricRtpLearner {
         self.latched = None;
         self.candidate = None;
         self.rebindings = 0;
+    }
+
+    /// Record the address the peer signalled (SDP connection address or the
+    /// ICE-nominated pair). See the module docs for why it outranks a learned
+    /// source.
+    pub(crate) fn set_signalled(&mut self, signalled: Option<SocketAddr>) {
+        self.signalled = signalled;
     }
 
     pub(crate) fn observe(
@@ -163,6 +184,20 @@ impl SymmetricRtpLearner {
             self.latched = Some(latched);
             self.candidate = None;
             return SymmetricRtpDecision::Accept;
+        }
+
+        if self.signalled == Some(source) {
+            // The peer is sending from the address it signalled: whatever was
+            // latched before was not this call's peer (a stale stream on a
+            // reused port). Take the latch back at once; this does not count
+            // against `max_rebindings`, which bounds learned moves only.
+            self.latched = Some(LatchedSource {
+                address: source,
+                ssrc,
+                last_sequence: sequence,
+            });
+            self.candidate = None;
+            return SymmetricRtpDecision::Rebind;
         }
 
         if self.rebindings >= self.policy.max_rebindings
@@ -312,6 +347,75 @@ mod tests {
         assert_eq!(
             learner.observe(candidate, 7, 102, now),
             SymmetricRtpDecision::Probation
+        );
+    }
+    #[test]
+    fn signalled_peer_takes_the_latch_back_from_a_stale_stream() {
+        let now = Instant::now();
+        let mut learner = SymmetricRtpLearner::new(SymmetricRtpPolicy::default());
+        let signalled = addr([203, 0, 113, 5], 44_276);
+        learner.set_signalled(Some(signalled));
+        // A stream left over from an earlier call on this port, same carrier
+        // IP but another port and SSRC, arrives first and wins the latch.
+        let stale = addr([203, 0, 113, 5], 51_000);
+        assert_eq!(
+            learner.observe(stale, 99, 5_000, now),
+            SymmetricRtpDecision::LatchInitial
+        );
+        // The real peer sends from its signalled address and takes over...
+        assert_eq!(
+            learner.observe(signalled, 7, 100, now),
+            SymmetricRtpDecision::Rebind
+        );
+        assert_eq!(
+            learner.observe(signalled, 7, 101, now),
+            SymmetricRtpDecision::Accept
+        );
+        // ...and the stale stream can no longer take it back.
+        assert_eq!(
+            learner.observe(stale, 99, 5_001, now),
+            SymmetricRtpDecision::Reject
+        );
+        assert_eq!(
+            learner.observe(signalled, 7, 102, now),
+            SymmetricRtpDecision::Accept
+        );
+    }
+
+    #[test]
+    fn signalled_peer_on_another_ip_still_takes_the_latch_back() {
+        let now = Instant::now();
+        let mut learner = SymmetricRtpLearner::new(SymmetricRtpPolicy::default());
+        let signalled = addr([203, 0, 113, 5], 44_276);
+        learner.set_signalled(Some(signalled));
+        assert_eq!(
+            learner.observe(addr([198, 51, 100, 9], 40_000), 99, 1, now),
+            SymmetricRtpDecision::LatchInitial
+        );
+        assert_eq!(
+            learner.observe(signalled, 7, 100, now),
+            SymmetricRtpDecision::Rebind
+        );
+    }
+
+    #[test]
+    fn nat_peer_that_never_uses_its_signalled_address_is_learned_as_before() {
+        let now = Instant::now();
+        let mut learner = SymmetricRtpLearner::new(SymmetricRtpPolicy::default());
+        // A phone behind NAT signals its private address.
+        learner.set_signalled(Some(addr([10, 0, 0, 7], 4_000)));
+        let public = addr([192, 0, 2, 10], 20_000);
+        assert_eq!(
+            learner.observe(public, 7, 100, now),
+            SymmetricRtpDecision::LatchInitial
+        );
+        assert_eq!(
+            learner.observe(public, 7, 101, now),
+            SymmetricRtpDecision::Accept
+        );
+        assert_eq!(
+            learner.observe(addr([198, 51, 100, 1], 20_001), 7, 102, now),
+            SymmetricRtpDecision::Reject
         );
     }
 }

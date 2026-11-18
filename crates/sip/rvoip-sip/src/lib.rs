@@ -602,6 +602,7 @@ pub use auth::{
 pub use rvoip_media_core::performance::pool::PoolConfig as MediaPoolConfig;
 pub use rvoip_media_core::prelude::{StunClient, StunError};
 pub use rvoip_media_core::processing::audio::playout::{PlayoutConfig, PlayoutStats};
+pub use rvoip_media_core::relay::MediaDiagnostics;
 pub use rvoip_media_core::types::AudioFrame;
 
 /// SIP_API_DESIGN_2 §3.6 — convenience body constructors. Each

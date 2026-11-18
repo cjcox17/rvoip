@@ -1859,6 +1859,33 @@ impl MediaAdapter {
             .await
     }
 
+    pub(crate) async fn media_diagnostics(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<rvoip_media_core::relay::MediaDiagnostics> {
+        self.media_diagnostics_of(self.current_media(session_id)?)
+            .await
+    }
+
+    pub(crate) async fn media_diagnostics_exact(
+        &self,
+        handle: &SessionRegistryHandle,
+    ) -> Option<rvoip_media_core::relay::MediaDiagnostics> {
+        self.media_diagnostics_of(self.media_for_handle_exact(handle)?)
+            .await
+    }
+
+    async fn media_diagnostics_of(
+        &self,
+        exact: ExactMediaSession,
+    ) -> Option<rvoip_media_core::relay::MediaDiagnostics> {
+        let diagnostics = self.controller.media_diagnostics(&exact.dialog_id).await;
+        if !self.media_is_still_exact(&exact) {
+            return None;
+        }
+        diagnostics
+    }
+
     async fn media_quality_of(
         &self,
         exact: ExactMediaSession,

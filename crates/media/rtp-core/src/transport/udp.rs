@@ -238,6 +238,64 @@ use crate::packet::RtpPacket;
 use crate::traits::RtpEvent;
 use crate::Result;
 
+/// What the RTP receive loop did with the datagrams it read, for diagnosing
+/// a leg that carries no audio. Aggregate counts only: no addresses, SSRCs
+/// or payload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransportReceiveDiagnostics {
+    /// Datagrams read from the RTP socket.
+    pub datagrams: u64,
+    /// RTP packets delivered to the session (after SRTP and symmetric-RTP).
+    pub rtp_delivered: u64,
+    /// STUN datagrams handed to the ICE agent.
+    pub stun: u64,
+    /// DTLS datagrams handed to a handshake.
+    pub dtls_forwarded: u64,
+    /// DTLS datagrams dropped because no handshake was listening.
+    pub dtls_dropped: u64,
+    /// SRTP packets that failed authentication or decryption.
+    pub srtp_unprotect_failures: u64,
+    /// RTP dropped because SRTP is required and no context is installed yet.
+    pub secure_drops_without_context: u64,
+    /// Datagrams that were not RTP, RTCP, STUN or DTLS.
+    pub non_media_drops: u64,
+    /// Datagrams that looked like RTP but did not parse.
+    pub malformed_rtp: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReceiveCounters {
+    datagrams: AtomicU64,
+    rtp_delivered: AtomicU64,
+    stun: AtomicU64,
+    dtls_forwarded: AtomicU64,
+    dtls_dropped: AtomicU64,
+    srtp_unprotect_failures: AtomicU64,
+    secure_drops_without_context: AtomicU64,
+    non_media_drops: AtomicU64,
+    malformed_rtp: AtomicU64,
+}
+
+impl ReceiveCounters {
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> TransportReceiveDiagnostics {
+        TransportReceiveDiagnostics {
+            datagrams: self.datagrams.load(Ordering::Relaxed),
+            rtp_delivered: self.rtp_delivered.load(Ordering::Relaxed),
+            stun: self.stun.load(Ordering::Relaxed),
+            dtls_forwarded: self.dtls_forwarded.load(Ordering::Relaxed),
+            dtls_dropped: self.dtls_dropped.load(Ordering::Relaxed),
+            srtp_unprotect_failures: self.srtp_unprotect_failures.load(Ordering::Relaxed),
+            secure_drops_without_context: self.secure_drops_without_context.load(Ordering::Relaxed),
+            non_media_drops: self.non_media_drops.load(Ordering::Relaxed),
+            malformed_rtp: self.malformed_rtp.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// UDP transport for RTP/RTCP
 ///
 /// This implementation supports RTCP multiplexing as defined in RFC 5761,
@@ -367,6 +425,15 @@ pub struct UdpRtpTransport {
     /// can update the cached symmetric-RTP target with a single atomic
     /// store instead of an awaited `Mutex` guard.
     remote_rtp_addr: Arc<ArcSwapOption<SocketAddr>>,
+
+    /// The peer's signalled RTP address (SDP or ICE), as last given to
+    /// [`Self::set_remote_rtp_addr`]. Unlike [`Self::remote_rtp_addr`] it is
+    /// never overwritten by symmetric-RTP learning; the receive loop lets a
+    /// packet from it outrank a learned source (see `symmetric.rs`).
+    signalled_rtp_addr: Arc<ArcSwapOption<SocketAddr>>,
+
+    /// Receive-loop outcome counters ([`Self::receive_diagnostics`]).
+    receive_counters: Arc<ReceiveCounters>,
 
     /// Remote RTCP address — same lock-free swap discipline as
     /// [`Self::remote_rtp_addr`].
@@ -595,6 +662,8 @@ impl UdpRtpTransport {
             symmetric_rtp_latched: Arc::new(AtomicBool::new(false)),
             symmetric_rtp_generation: Arc::new(AtomicU64::new(0)),
             remote_rtp_addr: Arc::new(ArcSwapOption::from(None)),
+            signalled_rtp_addr: Arc::new(ArcSwapOption::from(None)),
+            receive_counters: Arc::new(ReceiveCounters::default()),
             remote_rtcp_addr: Arc::new(ArcSwapOption::from(None)),
             event_tx,
             receiver_tasks: Arc::new(Mutex::new(Vec::with_capacity(2))),
@@ -651,6 +720,8 @@ impl UdpRtpTransport {
         let symmetric_rtp_latched = self.symmetric_rtp_latched.clone();
         let symmetric_rtp_generation = self.symmetric_rtp_generation.clone();
         let remote_rtp_addr = self.remote_rtp_addr.clone();
+        let signalled_rtp_addr = self.signalled_rtp_addr.clone();
+        let counters = self.receive_counters.clone();
         let remote_rtcp_addr = self.remote_rtcp_addr.clone();
         let rtcp_mux = self.rtcp_mux.clone();
         let latched_rtp_ssrc = self.latched_rtp_ssrc.clone();
@@ -669,6 +740,7 @@ impl UdpRtpTransport {
                 let mut non_rtp_drop_count = 0_u64;
                 let mut malformed_rtp_drop_count = 0_u64;
                 let mut symmetric_rtp = SymmetricRtpLearner::new(symmetric_rtp_policy);
+                symmetric_rtp.set_signalled(signalled_rtp_addr.load().as_deref().copied());
                 let mut observed_symmetric_generation =
                     symmetric_rtp_generation.load(Ordering::Acquire);
                 debug!("UDP receive loop started on {:?}", rtp_socket.local_addr());
@@ -685,9 +757,11 @@ impl UdpRtpTransport {
                     match rtp_socket.recv_from(&mut buffer).await {
                         Ok((size, addr)) => {
                             trace!("UDP recv_from returned {} bytes from {}", size, addr);
+                            ReceiveCounters::bump(&counters.datagrams);
 
                             let packet_class = classify_rtp_mux_packet(&buffer[..size]);
                             if packet_class == RtpMuxPacketClass::Stun {
+                                ReceiveCounters::bump(&counters.stun);
                                 // ICE connectivity checks share the media
                                 // port by design. Forward them to whoever
                                 // subscribed (the ICE agent's pump); with no
@@ -713,6 +787,11 @@ impl UdpRtpTransport {
                                         tx.try_send(Bytes::copy_from_slice(&buffer[..size])).is_ok()
                                     })
                                     .unwrap_or(false);
+                                ReceiveCounters::bump(if forwarded {
+                                    &counters.dtls_forwarded
+                                } else {
+                                    &counters.dtls_dropped
+                                });
                                 if !forwarded {
                                     // No handshake in flight (or its
                                     // receiver is backed up) to hand this
@@ -732,6 +811,7 @@ impl UdpRtpTransport {
                             }
 
                             if !packet_class.is_media() {
+                                ReceiveCounters::bump(&counters.non_media_drops);
                                 non_rtp_drop_count = non_rtp_drop_count.saturating_add(1);
                                 log_dropped_non_rtp_packet(
                                     rtp_diagnostics,
@@ -822,6 +902,9 @@ impl UdpRtpTransport {
                                     match ctx.unprotect(&buffer[0..size]) {
                                         Ok(packet) => Ok(packet),
                                         Err(_) => {
+                                            ReceiveCounters::bump(
+                                                &counters.srtp_unprotect_failures,
+                                            );
                                             srtp_unprotect_failures += 1;
                                             if srtp_diagnostics
                                                 && (srtp_unprotect_failures <= 5
@@ -841,6 +924,7 @@ impl UdpRtpTransport {
                                         }
                                     }
                                 } else if secure_media_required.load(Ordering::Acquire) {
+                                    ReceiveCounters::bump(&counters.secure_drops_without_context);
                                     trace!("SRTP is required but no receive context is installed; dropping packet");
                                     drop(srtp_guard);
                                     continue;
@@ -854,6 +938,9 @@ impl UdpRtpTransport {
                                             symmetric_rtp_generation.load(Ordering::Acquire);
                                         if generation != observed_symmetric_generation {
                                             symmetric_rtp.reset();
+                                            symmetric_rtp.set_signalled(
+                                                signalled_rtp_addr.load().as_deref().copied(),
+                                            );
                                             observed_symmetric_generation = generation;
                                         }
                                         let decision = symmetric_rtp.observe(
@@ -990,6 +1077,7 @@ impl UdpRtpTransport {
                                             continue;
                                         }
 
+                                        ReceiveCounters::bump(&counters.rtp_delivered);
                                         // Create RTP event
                                         let event = RtpEvent::MediaReceived {
                                             payload_type: packet.header.payload_type,
@@ -1013,6 +1101,7 @@ impl UdpRtpTransport {
                                         }
                                     }
                                     Err(e) => {
+                                        ReceiveCounters::bump(&counters.malformed_rtp);
                                         malformed_rtp_drop_count =
                                             malformed_rtp_drop_count.saturating_add(1);
                                         log_malformed_rtp_packet(
@@ -1239,6 +1328,7 @@ impl UdpRtpTransport {
     /// Set the remote RTP address
     pub async fn set_remote_rtp_addr(&self, addr: SocketAddr) {
         self.symmetric_rtp_latched.store(false, Ordering::Release);
+        self.signalled_rtp_addr.store(Some(Arc::new(addr)));
         self.remote_rtp_addr.store(Some(Arc::new(addr)));
         self.symmetric_rtp_generation.fetch_add(1, Ordering::AcqRel);
     }
@@ -1309,6 +1399,26 @@ impl UdpRtpTransport {
     /// intentionally omitted.
     pub fn symmetric_rtp_diagnostics(&self) -> SymmetricRtpDiagnostics {
         self.symmetric_rtp_counters.snapshot()
+    }
+
+    /// What the receive loop did with every datagram it read so far.
+    pub fn receive_diagnostics(&self) -> TransportReceiveDiagnostics {
+        self.receive_counters.snapshot()
+    }
+
+    /// The peer's signalled RTP address (SDP or ICE), never a learned one.
+    pub fn signalled_rtp_addr(&self) -> Option<SocketAddr> {
+        self.signalled_rtp_addr.load().as_deref().copied()
+    }
+
+    /// Whether this transport only accepts and sends SRTP.
+    pub fn is_secure_media_required(&self) -> bool {
+        self.secure_media_required.load(Ordering::Acquire)
+    }
+
+    /// Whether the receive loop is still running.
+    pub fn is_receiving(&self) -> bool {
+        self.active.load(Ordering::Acquire)
     }
 
     /// Subscribe to transport events

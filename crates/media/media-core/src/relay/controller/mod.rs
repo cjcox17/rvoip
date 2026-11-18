@@ -738,6 +738,7 @@ mod tests;
 // Re-export important types
 pub use audio_generation::{AudioSource, AudioTransmitterConfig};
 pub use bridge::{BridgeError, BridgeHandle, BridgeMode};
+pub use statistics::MediaDiagnostics;
 pub use types::{
     AdvancedProcessorConfig, AdvancedProcessorSet, MediaConfig, MediaSessionEvent,
     MediaSessionInfo, MediaSessionStatus, AMR_DTX_PARAMETER, NEGOTIATED_FMTP_PARAMETER,
