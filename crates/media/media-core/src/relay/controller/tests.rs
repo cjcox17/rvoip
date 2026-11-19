@@ -566,7 +566,7 @@ mod tests {
                         .unwrap();
                 }
             }
-            drop(rtp_tx); // Handler drains events, then closes its callback clone.
+            // Keep the RTP source open while the receiver plays its queued frames.
             let mut previous = None;
             for _ in 0..5 {
                 let frame =

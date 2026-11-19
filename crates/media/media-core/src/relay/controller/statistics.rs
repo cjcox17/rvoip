@@ -112,6 +112,7 @@ impl MediaSessionController {
         let symmetric_rtp = udp
             .map(|udp| udp.symmetric_rtp_diagnostics())
             .unwrap_or_default();
+        let bridge = self.bridges.info(dialog_id);
         Some(MediaDiagnostics {
             local_addr,
             local_rtcp_addr,
@@ -126,13 +127,13 @@ impl MediaSessionController {
             rtcp_packets_received: stats.rtcp_packets_received,
             receive,
             symmetric_rtp,
-            bridged_to: self.bridge_partner(dialog_id),
-            bridge_transcodes: self
-                .bridge_modes
-                .get(dialog_id)
-                .is_some_and(|mode| *mode.value() == super::BridgeMode::Transcode),
+            bridged_to: bridge.as_ref().map(|(peer, _)| peer.clone()),
+            bridge_transcodes: bridge
+                .as_ref()
+                .is_some_and(|(_, mode)| *mode == super::BridgeMode::Transcode),
             bridge_forwarder_alive: self
-                .bridge_forwarders
+                .bridges
+                .forwarders
                 .get(dialog_id)
                 .map(|alive| alive.load(std::sync::atomic::Ordering::Acquire)),
             dtls: self

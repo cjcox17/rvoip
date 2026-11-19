@@ -41,6 +41,10 @@ pub(super) struct SourceTimeline {
 }
 
 impl SourceTimeline {
+    pub(super) fn last_duration_ticks(&self) -> Option<u32> {
+        self.active.map(|active| active.duration_ticks)
+    }
+
     /// A replacement source needs two sequential packets within 200 ms.
     /// The first is probation and is not decoded. Recently replaced sources
     /// may return (e.g. hold/resume), but only after the active source is quiet.
