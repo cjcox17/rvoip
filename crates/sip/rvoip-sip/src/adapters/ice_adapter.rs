@@ -81,6 +81,9 @@ struct IceRuntime {
     commands: mpsc::Sender<IceCommand>,
     material: IceMaterial,
     task: tokio::task::AbortHandle,
+    /// The media transport the pump steers; stopping the runtime releases
+    /// its hold on the nominated destination.
+    transport: Arc<dyn RtpTransport>,
 }
 
 /// One ICE runtime per media session, owned by the media adapter.
@@ -179,7 +182,7 @@ impl IceRuntimes {
             session_id.0.clone(),
             dialog_id.clone(),
             Arc::clone(controller),
-            transport,
+            Arc::clone(&transport),
             agent,
             commands_rx,
         ));
@@ -189,6 +192,7 @@ impl IceRuntimes {
                 commands: commands_tx,
                 material: material.clone(),
                 task: task.abort_handle(),
+                transport,
             },
         );
         Some(material)
@@ -217,10 +221,20 @@ impl IceRuntimes {
     }
 
     /// Tear a session's runtime down (peer declined ICE, or the session
-    /// ended). Idempotent.
+    /// ended). Idempotent. Media held on an ICE-nominated address returns
+    /// to the SDP-signalled one: without a running agent nothing keeps that
+    /// pair alive, and a rewritten (ice-mismatched) default is the only
+    /// address a middlebox will relay.
     pub(crate) fn stop(&self, session_id: &SessionId) {
         if let Some((_, runtime)) = self.runtimes.remove(session_id) {
             runtime.task.abort();
+            if let Some(udp) = runtime
+                .transport
+                .as_any()
+                .downcast_ref::<rvoip_rtp_core::transport::UdpRtpTransport>()
+            {
+                udp.clear_ice_selected_rtp_addr();
+            }
         }
     }
 }
@@ -250,21 +264,16 @@ async fn run_ice_pump(
                 IceEvent::Selected { local_base, remote } => {
                     tracing::info!(
                         session = %session_label,
-                        %local_base,
-                        %remote,
+                        remote_kind = address_kind(remote),
                         "ICE nominated a pair; retargeting media"
                     );
-                    if let Err(error) = controller.establish_media_flow(&dialog_id, remote).await {
-                        tracing::warn!(
-                            session = %session_label,
-                            %error,
-                            "media retarget after ICE nomination failed"
-                        );
-                    }
+                    tracing::debug!(session = %session_label, %local_base, %remote, "ICE nominated pair");
+                    retarget_to_selected(&session_label, &controller, &dialog_id, remote).await;
                     // Post-nomination re-INVITE (RFC 8839 §4.4) when the
                     // nominated pair differs from the SDP default is the
                     // coordinator's follow-up; the media path itself is
-                    // already correct from this retarget.
+                    // already correct from this retarget, and SDP commits
+                    // (answers, renegotiations) leave it in place.
                 }
                 IceEvent::ConsentExpired => {
                     tracing::warn!(
@@ -304,6 +313,12 @@ async fn run_ice_pump(
                     for candidate in candidates {
                         agent.add_remote_candidate(candidate);
                     }
+                    // The peer's SDP arrived after a nomination (an ICE-lite
+                    // offerer answers checks before the answer): re-assert
+                    // the nominated pair over whatever the SDP signalled.
+                    if let Some((_, remote)) = agent.selected_pair() {
+                        retarget_to_selected(&session_label, &controller, &dialog_id, remote).await;
+                    }
                 }
                 None => break,
             },
@@ -321,6 +336,40 @@ async fn run_ice_pump(
         }
     }
     tracing::debug!(session = %session_label, "ICE pump ended");
+}
+
+/// Hold the session's media on the nominated address.
+async fn retarget_to_selected(
+    session_label: &str,
+    controller: &MediaSessionController,
+    dialog_id: &DialogId,
+    remote: SocketAddr,
+) {
+    if let Err(error) = controller.establish_ice_media_flow(dialog_id, remote).await {
+        tracing::warn!(
+            session = %session_label,
+            %error,
+            "media retarget after ICE nomination failed"
+        );
+    }
+}
+
+/// What kind of address `addr` is, for logs that must not carry addresses:
+/// `loopback`, `private` (RFC 1918 / unique-local), `link-local`,
+/// `unspecified` or `public`, with the IP version.
+pub(crate) fn address_kind(addr: SocketAddr) -> &'static str {
+    match addr.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => "loopback-v4",
+        IpAddr::V4(ip) if ip.is_private() => "private-v4",
+        IpAddr::V4(ip) if ip.is_link_local() => "link-local-v4",
+        IpAddr::V4(ip) if ip.is_unspecified() => "unspecified-v4",
+        IpAddr::V4(_) => "public-v4",
+        IpAddr::V6(ip) if ip.is_loopback() => "loopback-v6",
+        IpAddr::V6(ip) if (ip.segments()[0] & 0xfe00) == 0xfc00 => "private-v6",
+        IpAddr::V6(ip) if (ip.segments()[0] & 0xffc0) == 0xfe80 => "link-local-v6",
+        IpAddr::V6(ip) if ip.is_unspecified() => "unspecified-v6",
+        IpAddr::V6(_) => "public-v6",
+    }
 }
 
 /// Extract the peer's ICE material from parsed SDP, or `None` when the peer
@@ -542,6 +591,21 @@ mod tests {
 
     const BASE: &str =
         "v=0\r\no=- 1 1 IN IP4 198.51.100.7\r\ns=-\r\nc=IN IP4 198.51.100.7\r\nt=0 0\r\n";
+
+    #[test]
+    fn address_kinds_name_no_address() {
+        let kind = |addr: &str| address_kind(addr.parse().unwrap());
+        assert_eq!(kind("127.0.0.1:1"), "loopback-v4");
+        assert_eq!(kind("10.0.1.2:1"), "private-v4");
+        assert_eq!(kind("192.168.0.2:1"), "private-v4");
+        assert_eq!(kind("169.254.0.2:1"), "link-local-v4");
+        assert_eq!(kind("0.0.0.0:9"), "unspecified-v4");
+        assert_eq!(kind("203.0.113.9:1"), "public-v4");
+        assert_eq!(kind("[::1]:1"), "loopback-v6");
+        assert_eq!(kind("[fd00::2]:1"), "private-v6");
+        assert_eq!(kind("[fe80::2]:1"), "link-local-v6");
+        assert_eq!(kind("[2001:db8::2]:1"), "public-v6");
+    }
 
     #[test]
     fn a_peer_without_ice_yields_none() {

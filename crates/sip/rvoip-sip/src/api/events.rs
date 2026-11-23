@@ -219,6 +219,34 @@ pub enum MediaSecurityKeying {
     DtlsSrtp,
 }
 
+/// Why DTLS-SRTP keying failed after the offer/answer committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaSecurityFailure {
+    /// No handshake completed before the deadline: this side's flights
+    /// never reached the peer, or the peer never sent its own.
+    Timeout,
+    /// The DTLS engine failed the handshake (a peer alert or a protocol
+    /// error).
+    Handshake,
+    /// The peer's certificate does not match the fingerprint in its SDP.
+    FingerprintMismatch,
+    /// The handshake could not start or its keys could not be installed.
+    Setup,
+}
+
+impl MediaSecurityFailure {
+    /// A stable lowercase name for logs and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Handshake => "handshake",
+            Self::FingerprintMismatch => "fingerprint-mismatch",
+            Self::Setup => "setup",
+        }
+    }
+}
+
 /// RTP profile negotiated for protected media.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaSecurityProfile {
@@ -897,6 +925,28 @@ pub enum Event {
         contexts_installed: bool,
     },
 
+    /// DTLS-SRTP keying failed after the offer/answer committed: the call
+    /// is up in signalling but carries no media.
+    ///
+    /// Carries no addresses. [`SessionHandle::media_diagnostics`](crate::api::handle::SessionHandle)
+    /// has the transport's view at the time of the failure.
+    MediaSecurityFailed {
+        /// Session identifier for the media stream.
+        call_id: CallId,
+        /// Why the handshake failed.
+        reason: MediaSecurityFailure,
+        /// Whether ICE had nominated the pair media was sent on.
+        ice_selected: bool,
+        /// Whether media (and the handshake) went to the SDP-signalled
+        /// address.
+        remote_matches_signalled: bool,
+        /// DTLS datagrams from the peer that arrived before the handshake
+        /// started.
+        dtls_datagrams_before_handshake: u64,
+        /// DTLS datagrams handed to the handshake.
+        dtls_datagrams_forwarded: u64,
+    },
+
     // ===== Registration Events =====
     /// Registration successful.
     ///
@@ -1233,6 +1283,24 @@ impl std::fmt::Debug for Event {
                 .field("profile", profile)
                 .field("contexts_installed", contexts_installed)
                 .finish(),
+            Self::MediaSecurityFailed {
+                reason,
+                ice_selected,
+                remote_matches_signalled,
+                dtls_datagrams_before_handshake,
+                dtls_datagrams_forwarded,
+                ..
+            } => formatter
+                .debug_struct("MediaSecurityFailed")
+                .field("reason", reason)
+                .field("ice_selected", ice_selected)
+                .field("remote_matches_signalled", remote_matches_signalled)
+                .field(
+                    "dtls_datagrams_before_handshake",
+                    dtls_datagrams_before_handshake,
+                )
+                .field("dtls_datagrams_forwarded", dtls_datagrams_forwarded)
+                .finish(),
             Self::RegistrationSuccess {
                 registrar,
                 expires,
@@ -1316,6 +1384,7 @@ impl Event {
             | Event::DtmfReceived { call_id, .. }
             | Event::MediaQualityChanged { call_id, .. }
             | Event::MediaSecurityNegotiated { call_id, .. }
+            | Event::MediaSecurityFailed { call_id, .. }
             | Event::NotifyReceived { call_id, .. }
             | Event::AuthenticationRequired { call_id, .. } => Some(call_id),
             Event::TransferTargetAnswered {
@@ -1410,6 +1479,7 @@ impl Event {
             Event::DtmfReceived { .. }
                 | Event::MediaQualityChanged { .. }
                 | Event::MediaSecurityNegotiated { .. }
+                | Event::MediaSecurityFailed { .. }
         )
     }
 
