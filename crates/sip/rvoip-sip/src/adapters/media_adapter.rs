@@ -3500,8 +3500,71 @@ impl MediaAdapter {
                     session = %handle.session_id().0,
                     "DTLS-SRTP handshake failed after signaling commit: {error}"
                 );
+                adapter
+                    .publish_media_security_failure(&handle, &dialog_id)
+                    .await;
             }
         });
+    }
+
+    /// Tell the application that DTLS-SRTP keying failed after the commit,
+    /// with the transport's view of why (counts and booleans only).
+    #[cfg(feature = "dtls-srtp")]
+    async fn publish_media_security_failure(
+        &self,
+        handle: &SessionRegistryHandle,
+        dialog_id: &DialogId,
+    ) {
+        let Some(diagnostics) = self.controller.media_diagnostics(dialog_id).await else {
+            return;
+        };
+        let Some(failure) = diagnostics.dtls.and_then(|dtls| dtls.failure) else {
+            return;
+        };
+        use crate::api::events::MediaSecurityFailure;
+        let reason = match failure {
+            rvoip_media_core::relay::DtlsFailure::Timeout => MediaSecurityFailure::Timeout,
+            rvoip_media_core::relay::DtlsFailure::Handshake => MediaSecurityFailure::Handshake,
+            rvoip_media_core::relay::DtlsFailure::FingerprintMismatch => {
+                MediaSecurityFailure::FingerprintMismatch
+            }
+            rvoip_media_core::relay::DtlsFailure::Setup => MediaSecurityFailure::Setup,
+        };
+        tracing::warn!(
+            session = %handle.session_id().0,
+            reason = reason.as_str(),
+            ice_selected = diagnostics.ice_selected,
+            remote_matches_signalled = diagnostics.remote_matches_signalled,
+            remote_kind = diagnostics
+                .current_remote_addr
+                .map_or("none", crate::adapters::ice_adapter::address_kind),
+            signalled_kind = diagnostics
+                .signalled_remote_addr
+                .map_or("none", crate::adapters::ice_adapter::address_kind),
+            dtls_before_handshake = diagnostics.dtls_datagrams_before_handshake.unwrap_or(0),
+            dtls_forwarded = diagnostics.receive.dtls_forwarded,
+            "DTLS-SRTP keying failed after the offer/answer committed; the call has no media"
+        );
+        let event = Event::MediaSecurityFailed {
+            call_id: handle.session_id().clone(),
+            reason,
+            ice_selected: diagnostics.ice_selected,
+            remote_matches_signalled: diagnostics.remote_matches_signalled,
+            dtls_datagrams_before_handshake: diagnostics
+                .dtls_datagrams_before_handshake
+                .unwrap_or(0),
+            dtls_datagrams_forwarded: diagnostics.receive.dtls_forwarded,
+        };
+        if let Some(publisher) = self.app_event_publisher.read().await.clone() {
+            publisher.publish_exact(handle, event);
+        } else if let Some(coordinator) = self.global_coordinator.read().await.clone() {
+            let public = crate::adapters::SessionApiCrossCrateEvent::new(
+                crate::adapters::sanitize_session_api_observation(&event),
+            );
+            if let Err(error) = coordinator.publish_observational(public).await {
+                tracing::warn!("Failed to publish MediaSecurityFailed event: {}", error);
+            }
+        }
     }
 
     #[cfg(feature = "dtls-srtp")]
@@ -11213,5 +11276,339 @@ a=fmtp:101 0-15\r\n";
             1,
             "authority teardown must reuse the completed release cell"
         );
+    }
+
+    // ===== ICE-lite offerer: the answer commit and the nominated pair =====
+    //
+    // An ICE-lite offerer answers the peer's connectivity checks as soon as
+    // the peer has the offer, which is usually before the SDP answer comes
+    // back. When the peer nominates (USE-CANDIDATE) in that window, the
+    // nominated pair must survive the answer commit and every later
+    // renegotiation commit: the answer's default `c=`/`m=` address can be an
+    // address this endpoint cannot reach (a private host address behind a
+    // NAT), while the nominated address is the one the checks proved.
+
+    #[cfg(feature = "dtls-srtp")]
+    /// A WebRTC-style offerer: ICE-lite, DTLS-SRTP, rtcp-mux.
+    fn ice_lite_dtls_offerer(adapter: &mut MediaAdapter) {
+        adapter.set_rtcp_mux_required(true);
+        adapter.set_dtls_srtp_policy(true);
+        adapter.set_ice_policy(crate::adapters::ice_adapter::SipIcePolicy::Lite);
+    }
+
+    /// An address nothing answers on (TEST-NET-1, discard port): the
+    /// answer's default when the peer's host address is not reachable.
+    #[cfg(feature = "dtls-srtp")]
+    fn unreachable_default() -> SocketAddr {
+        "192.0.2.10:9".parse().unwrap()
+    }
+
+    /// A full, controlling ICE peer on a raw socket that nominates the
+    /// offer's candidate, as a browser does.
+    #[cfg(feature = "dtls-srtp")]
+    struct IceTestPeer {
+        socket: tokio::net::UdpSocket,
+        agent: rvoip_ice_core::IceAgent,
+        addr: SocketAddr,
+    }
+
+    #[cfg(feature = "dtls-srtp")]
+    impl IceTestPeer {
+        async fn for_offer(offer: &str) -> Self {
+            use rvoip_ice_core::{AgentConfig, Candidate, Credentials, IceAgent, IceRole};
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            let remote = crate::adapters::ice_adapter::extract_remote_ice(
+                &SdpSession::from_str(offer).expect("offer parses"),
+            )
+            .expect("the offer carries ICE");
+            assert!(remote.lite, "the offerer is ICE-lite: {offer}");
+            let mut agent = IceAgent::new(AgentConfig::full(
+                IceRole::Controlling,
+                Credentials::generate(),
+            ));
+            agent.add_local_candidate(Candidate::host(addr, 1, 65_535));
+            agent.set_remote_credentials(remote.credentials);
+            for candidate in remote.candidates {
+                agent.add_remote_candidate(candidate);
+            }
+            Self {
+                socket,
+                agent,
+                addr,
+            }
+        }
+
+        fn credentials(&self) -> rvoip_ice_core::Credentials {
+            self.agent.local_credentials().clone()
+        }
+
+        /// Run checks until the peer has nominated a pair.
+        async fn nominate(&mut self) {
+            use rvoip_ice_core::IceState;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut buffer = [0_u8; 1500];
+            while tokio::time::Instant::now() < deadline
+                && self.agent.state() != IceState::Completed
+            {
+                self.agent.handle_timeout(std::time::Instant::now());
+                while let Some(transmit) = self.agent.poll_transmit() {
+                    self.socket
+                        .send_to(&transmit.payload, transmit.to)
+                        .await
+                        .unwrap();
+                }
+                while self.agent.poll_event().is_some() {}
+                if let Ok(Ok((size, from))) = tokio::time::timeout(
+                    Duration::from_millis(20),
+                    self.socket.recv_from(&mut buffer),
+                )
+                .await
+                {
+                    let _ = self.agent.handle_packet(
+                        std::time::Instant::now(),
+                        self.addr,
+                        from,
+                        &buffer[..size],
+                    );
+                }
+            }
+            assert_eq!(
+                self.agent.state(),
+                IceState::Completed,
+                "the peer must nominate a pair against the ICE-lite offerer"
+            );
+        }
+    }
+
+    /// A browser-style answer whose default address and only candidate are
+    /// `default`, with `a=setup:active` (the peer is the DTLS client).
+    #[cfg(feature = "dtls-srtp")]
+    fn ice_dtls_answer(
+        default: SocketAddr,
+        credentials: &rvoip_ice_core::Credentials,
+        fingerprint: &[u8; 32],
+    ) -> String {
+        let ip = default.ip();
+        let port = default.port();
+        format!(
+            "v=0\r\n\
+             o=- 4242 2 IN IP4 {ip}\r\n\
+             s=-\r\n\
+             c=IN IP4 {ip}\r\n\
+             t=0 0\r\n\
+             m=audio {port} UDP/TLS/RTP/SAVP 0\r\n\
+             a=rtcp-mux\r\n\
+             a=setup:active\r\n\
+             a=fingerprint:sha-256 {}\r\n\
+             a=ice-ufrag:{}\r\n\
+             a=ice-pwd:{}\r\n\
+             a=candidate:1 1 UDP 2130706431 {ip} {port} typ host\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=sendrecv\r\n",
+            fingerprint_hex(fingerprint),
+            credentials.ufrag,
+            credentials.pwd,
+        )
+    }
+
+    impl NonMuxCall {
+        #[cfg(feature = "dtls-srtp")]
+        async fn local_rtp_addr(&self) -> SocketAddr {
+            let port = self.info().await.rtp_port.expect("RTP port allocated");
+            SocketAddr::from(([127, 0, 0, 1], port))
+        }
+
+        async fn live_remote(&self) -> Option<SocketAddr> {
+            self.controller
+                .media_diagnostics(&self.dialog_id)
+                .await
+                .expect("media diagnostics")
+                .current_remote_addr
+        }
+
+        /// Wait until media is sent to `expected` (the ICE pump retargets
+        /// asynchronously).
+        #[cfg(feature = "dtls-srtp")]
+        async fn await_live_remote(&self, expected: SocketAddr) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                if self.live_remote().await == Some(expected) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!(
+                "media was never retargeted to the nominated address; live remote is {:?}",
+                self.live_remote().await
+            );
+        }
+    }
+
+    /// The failure this guards: the peer nominates before the answer, the
+    /// answer's default address is unreachable, and the answer commit used
+    /// to move media and the DTLS handshake back to that default. The DTLS
+    /// server then answered the peer's ClientHello at an address the peer
+    /// is not on, and the call stayed silent.
+    #[cfg(feature = "dtls-srtp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_lite_offerer_keeps_a_nomination_made_before_the_answer() {
+        use crate::state_table::types::Role;
+        let mut call =
+            non_mux_call_with("ice-before-answer", Role::UAC, 31_100, None, false, |a| {
+                ice_lite_dtls_offerer(a)
+            })
+            .await;
+        let offer = call.offer().await;
+        let our_addr = call.local_rtp_addr().await;
+
+        let mut peer = IceTestPeer::for_offer(&offer).await;
+        peer.nominate().await;
+        call.await_live_remote(peer.addr).await;
+
+        // The peer starts DTLS as soon as ICE completes, before the answer
+        // reaches the offerer.
+        let identity = rvoip_rtp_core::dtls_srtp::generate_identity().expect("identity");
+        let answer = ice_dtls_answer(
+            unreachable_default(),
+            &peer.credentials(),
+            &identity.fingerprint_sha256,
+        );
+        let peer_addr = peer.addr;
+        peer.socket.connect(our_addr).await.unwrap();
+        let client = tokio::spawn(rvoip_rtp_core::dtls_srtp::handshake_client(
+            Arc::new(peer.socket),
+            identity,
+            rvoip_rtp_core::dtls_srtp::default_srtp_profiles(),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        call.accept_answer(&answer).await;
+        assert_eq!(
+            call.live_remote().await,
+            Some(peer_addr),
+            "the answer commit replaced the ICE-nominated address with the SDP default"
+        );
+
+        let handshake = tokio::time::timeout(Duration::from_secs(8), client)
+            .await
+            .expect("DTLS replies must reach the nominated address")
+            .expect("client task");
+        assert!(
+            handshake.is_ok(),
+            "the DTLS handshake must complete over the nominated pair: {handshake:?}"
+        );
+        assert_eq!(call.live_remote().await, Some(peer_addr));
+        call.hang_up().await;
+    }
+
+    /// The opposite order already worked and must keep working: the answer
+    /// commits first, the nomination after it retargets media.
+    #[cfg(feature = "dtls-srtp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_lite_offerer_follows_a_nomination_made_after_the_answer() {
+        use crate::state_table::types::Role;
+        let mut call = non_mux_call_with("ice-after-answer", Role::UAC, 31_200, None, false, |a| {
+            ice_lite_dtls_offerer(a)
+        })
+        .await;
+        let offer = call.offer().await;
+        let our_addr = call.local_rtp_addr().await;
+
+        let mut peer = IceTestPeer::for_offer(&offer).await;
+        let identity = rvoip_rtp_core::dtls_srtp::generate_identity().expect("identity");
+        call.accept_answer(&ice_dtls_answer(
+            unreachable_default(),
+            &peer.credentials(),
+            &identity.fingerprint_sha256,
+        ))
+        .await;
+        assert_eq!(call.live_remote().await, Some(unreachable_default()));
+
+        peer.nominate().await;
+        call.await_live_remote(peer.addr).await;
+
+        let peer_addr = peer.addr;
+        peer.socket.connect(our_addr).await.unwrap();
+        let handshake = tokio::time::timeout(
+            Duration::from_secs(8),
+            rvoip_rtp_core::dtls_srtp::handshake_client(
+                Arc::new(peer.socket),
+                identity,
+                rvoip_rtp_core::dtls_srtp::default_srtp_profiles(),
+            ),
+        )
+        .await
+        .expect("DTLS replies must reach the nominated address");
+        assert!(handshake.is_ok(), "{handshake:?}");
+        assert_eq!(call.live_remote().await, Some(peer_addr));
+        call.hang_up().await;
+    }
+
+    /// A renegotiation (hold, resume, session refresh with SDP) commits the
+    /// answer's default address again; it must not undo the nomination.
+    #[cfg(feature = "dtls-srtp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_lite_offerer_keeps_the_nomination_across_a_renegotiation() {
+        use crate::state_table::types::Role;
+        let mut call = non_mux_call_with("ice-reoffer", Role::UAC, 31_300, None, false, |a| {
+            ice_lite_dtls_offerer(a)
+        })
+        .await;
+        let offer = call.offer().await;
+        let mut peer = IceTestPeer::for_offer(&offer).await;
+        let identity = rvoip_rtp_core::dtls_srtp::generate_identity().expect("identity");
+        let answer = ice_dtls_answer(
+            unreachable_default(),
+            &peer.credentials(),
+            &identity.fingerprint_sha256,
+        );
+        call.accept_answer(&answer).await;
+        peer.nominate().await;
+        call.await_live_remote(peer.addr).await;
+
+        // The re-offer reuses the ICE material; the re-answer repeats the
+        // same unreachable default.
+        let reoffer = call.offer().await;
+        assert!(reoffer.contains("a=ice-lite"), "{reoffer}");
+        call.accept_answer(&answer.replace("o=- 4242 2", "o=- 4242 3"))
+            .await;
+        assert_eq!(
+            call.live_remote().await,
+            Some(peer.addr),
+            "the renegotiation commit replaced the ICE-nominated address with the SDP default"
+        );
+        call.hang_up().await;
+    }
+
+    /// A leg without ICE (a carrier, a desk phone) is unchanged: the answer's
+    /// address is where media goes, even on an endpoint that offers ICE.
+    #[tokio::test]
+    async fn a_peer_without_ice_gets_media_at_its_answer_address() {
+        use crate::state_table::types::Role;
+        let (peer_rtp, _peer_rtcp) = bind_peer_port_pair().await;
+        let peer_addr = peer_rtp.local_addr().unwrap();
+
+        let mut call =
+            non_mux_call_with("no-ice-plain", Role::UAC, 31_400, None, false, |_| {}).await;
+        let offer = call.offer().await;
+        assert!(!offer.contains("a=ice-ufrag"), "{offer}");
+        let mut answer = build_answer("peer", "127.0.0.1", peer_addr.port());
+        answer.push_str("a=rtcp-mux\r\n");
+        call.accept_answer(&answer).await;
+        assert_eq!(call.live_remote().await, Some(peer_addr));
+        call.hang_up().await;
+
+        // An ICE-lite endpoint whose peer declines ICE (no ICE attributes in
+        // the answer) also sends to the answer's address.
+        let mut call = non_mux_call_with("no-ice-declined", Role::UAC, 31_500, None, false, |a| {
+            a.set_ice_policy(crate::adapters::ice_adapter::SipIcePolicy::Lite)
+        })
+        .await;
+        let offer = call.offer().await;
+        assert!(offer.contains("a=ice-lite"), "{offer}");
+        call.accept_answer(&answer).await;
+        assert_eq!(call.live_remote().await, Some(peer_addr));
+        call.hang_up().await;
     }
 }

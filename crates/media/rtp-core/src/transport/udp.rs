@@ -436,6 +436,24 @@ pub struct UdpRtpTransport {
     /// packet from it outrank a learned source (see `symmetric.rs`).
     signalled_rtp_addr: Arc<ArcSwapOption<(SocketAddr, Instant)>>,
 
+    /// The peer address ICE nominated, while the session's ICE agent is
+    /// active ([`Self::set_ice_selected_rtp_addr`]). While it is set, an SDP
+    /// commit ([`Self::set_remote_rtp_addr`]) only records the SDP address
+    /// and leaves the destination on the nominated pair.
+    ice_selected_rtp_addr: ArcSwapOption<SocketAddr>,
+
+    /// The peer's SDP default address, as last given to
+    /// [`Self::set_remote_rtp_addr`], whether or not it is the destination.
+    sdp_rtp_addr: ArcSwapOption<SocketAddr>,
+
+    /// Serializes the SDP and ICE destination writers so a commit racing a
+    /// nomination cannot interleave their stores.
+    destination_writer: parking_lot::Mutex<()>,
+
+    /// DTLS datagrams dropped before the first handshake listened
+    /// ([`Self::dtls_datagrams_before_handshake`]); `u64::MAX` until then.
+    dtls_before_handshake: AtomicU64,
+
     /// Receive-loop outcome counters ([`Self::receive_diagnostics`]).
     receive_counters: Arc<ReceiveCounters>,
 
@@ -667,6 +685,10 @@ impl UdpRtpTransport {
             symmetric_rtp_generation: Arc::new(AtomicU64::new(0)),
             remote_rtp_addr: Arc::new(ArcSwapOption::from(None)),
             signalled_rtp_addr: Arc::new(ArcSwapOption::from(None)),
+            ice_selected_rtp_addr: ArcSwapOption::from(None),
+            sdp_rtp_addr: ArcSwapOption::from(None),
+            destination_writer: parking_lot::Mutex::new(()),
+            dtls_before_handshake: AtomicU64::new(u64::MAX),
             receive_counters: Arc::new(ReceiveCounters::default()),
             remote_rtcp_addr: Arc::new(ArcSwapOption::from(None)),
             event_tx,
@@ -1331,8 +1353,66 @@ impl UdpRtpTransport {
         Ok(())
     }
 
-    /// Set the remote RTP address
+    /// Set the remote RTP address from signalling (the SDP default).
+    ///
+    /// While an ICE-nominated address is set
+    /// ([`Self::set_ice_selected_rtp_addr`]) this only records `addr` as the
+    /// SDP address: the nominated pair is the one connectivity checks
+    /// proved, and the SDP default may be an address this endpoint cannot
+    /// reach (a peer's private host address behind a NAT).
     pub async fn set_remote_rtp_addr(&self, addr: SocketAddr) {
+        let _writer = self.destination_writer.lock();
+        self.sdp_rtp_addr.store(Some(Arc::new(addr)));
+        if self.ice_selected_rtp_addr.load().is_none() {
+            self.retarget(addr);
+        }
+    }
+
+    /// Point RTP (and anything sharing its socket, such as DTLS) at the
+    /// address ICE nominated, and keep it there across later SDP commits
+    /// until [`Self::clear_ice_selected_rtp_addr`]. A later nomination
+    /// replaces it.
+    pub fn set_ice_selected_rtp_addr(&self, addr: SocketAddr) {
+        let _writer = self.destination_writer.lock();
+        self.ice_selected_rtp_addr.store(Some(Arc::new(addr)));
+        self.retarget(addr);
+    }
+
+    /// Forget the ICE-nominated address (the session's ICE agent stopped:
+    /// the peer declined ICE or the answer was ice-mismatched) and return
+    /// to the SDP address, if one was signalled.
+    pub fn clear_ice_selected_rtp_addr(&self) {
+        let _writer = self.destination_writer.lock();
+        if self.ice_selected_rtp_addr.swap(None).is_none() {
+            return;
+        }
+        if let Some(sdp) = self.sdp_rtp_addr.load().as_deref().copied() {
+            self.retarget(sdp);
+        }
+    }
+
+    /// The address ICE nominated, while it governs the destination.
+    pub fn ice_selected_rtp_addr(&self) -> Option<SocketAddr> {
+        self.ice_selected_rtp_addr.load().as_deref().copied()
+    }
+
+    /// The peer's SDP default address, as last signalled, whether or not
+    /// media is sent there.
+    pub fn sdp_rtp_addr(&self) -> Option<SocketAddr> {
+        self.sdp_rtp_addr.load().as_deref().copied()
+    }
+
+    /// DTLS datagrams that arrived before the first DTLS handshake started
+    /// listening on this transport (they are dropped; a DTLS client
+    /// retransmits). `None` until a handshake has started.
+    pub fn dtls_datagrams_before_handshake(&self) -> Option<u64> {
+        match self.dtls_before_handshake.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            count => Some(count),
+        }
+    }
+
+    fn retarget(&self, addr: SocketAddr) {
         self.symmetric_rtp_latched.store(false, Ordering::Release);
         self.signalled_rtp_addr
             .store(Some(Arc::new((addr, Instant::now()))));
@@ -1387,6 +1467,12 @@ impl UdpRtpTransport {
 
         let (tx, rx) = mpsc::channel(64);
         *self.dtls_tx.lock() = Some(tx);
+        let _ = self.dtls_before_handshake.compare_exchange(
+            u64::MAX,
+            self.receive_counters.dtls_dropped.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
 
         Ok(Arc::new(
             crate::transport::dtls_bridge::DtlsUdpConnAdapter::new(
@@ -2270,6 +2356,55 @@ mod tests {
         let rendered = format!("{diagnostics:?}");
         assert!(!rendered.contains("127.0.0.1"));
         assert!(!rendered.contains("10203040"));
+    }
+
+    #[tokio::test]
+    async fn an_ice_selected_destination_outlives_later_sdp_commits() {
+        let config = RtpTransportConfig {
+            local_rtp_addr: "127.0.0.1:0".parse().unwrap(),
+            local_rtcp_addr: None,
+            symmetric_rtp: true,
+            rtcp_mux: true,
+            session_id: Some("ice-selected".to_string()),
+            use_port_allocator: false,
+            buffer_config: Default::default(),
+        };
+        let transport = UdpRtpTransport::new(config).await.unwrap();
+        let nominated: SocketAddr = "203.0.113.20:40000".parse().unwrap();
+        let sdp_default: SocketAddr = "10.0.0.5:50000".parse().unwrap();
+
+        // Without ICE the SDP address is the destination, as before.
+        transport.set_remote_rtp_addr(sdp_default).await;
+        assert_eq!(transport.remote_rtp_addr().await, Some(sdp_default));
+        assert_eq!(transport.signalled_rtp_addr(), Some(sdp_default));
+        assert_eq!(transport.ice_selected_rtp_addr(), None);
+
+        // A nomination moves media; a later SDP commit is only recorded.
+        transport.set_ice_selected_rtp_addr(nominated);
+        assert_eq!(transport.remote_rtp_addr().await, Some(nominated));
+        let renegotiated: SocketAddr = "10.0.0.5:50002".parse().unwrap();
+        transport.set_remote_rtp_addr(renegotiated).await;
+        assert_eq!(transport.remote_rtp_addr().await, Some(nominated));
+        assert_eq!(transport.signalled_rtp_addr(), Some(nominated));
+        assert_eq!(transport.sdp_rtp_addr(), Some(renegotiated));
+
+        // A new nomination (ICE restart, or the peer switching pairs) wins,
+        // IPv6 included.
+        let nominated_v6: SocketAddr = "[2001:db8::7]:40002".parse().unwrap();
+        transport.set_ice_selected_rtp_addr(nominated_v6);
+        assert_eq!(transport.remote_rtp_addr().await, Some(nominated_v6));
+
+        // When ICE stops, media returns to the SDP address and SDP commits
+        // apply directly again.
+        transport.clear_ice_selected_rtp_addr();
+        assert_eq!(transport.remote_rtp_addr().await, Some(renegotiated));
+        assert_eq!(transport.ice_selected_rtp_addr(), None);
+        transport.set_remote_rtp_addr(sdp_default).await;
+        assert_eq!(transport.remote_rtp_addr().await, Some(sdp_default));
+        // Clearing again is a no-op.
+        transport.clear_ice_selected_rtp_addr();
+        assert_eq!(transport.remote_rtp_addr().await, Some(sdp_default));
+        assert_eq!(transport.dtls_datagrams_before_handshake(), None);
     }
 
     #[tokio::test]

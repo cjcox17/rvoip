@@ -2399,6 +2399,9 @@ impl<H: CallHandler> CallbackPeer<H> {
                         .await;
                 }
 
+                // Observational: delivered through `on_event` above.
+                Event::MediaSecurityFailed { .. } => {}
+
                 Event::ReferReceived {
                     call_id: _, refer_to: _, request, ..
                 } => {

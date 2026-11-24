@@ -639,10 +639,10 @@ pub use api::dialog_package::{
 };
 pub use api::dialog_subscription::DialogSubscriptionHandle;
 pub use api::events::{
-    CallAuthRetryDetails, DiagnosticEvent, Event, MediaQualityStats, MediaSecurityKeying,
-    MediaSecurityProfile, MediaSecurityState, RenegotiationFailure, SdesNegotiationFailure,
-    SipTrace, SipTraceConfig, SipTraceDirection, SubscriptionState, TransferKind,
-    TransferTargetEvidence,
+    CallAuthRetryDetails, DiagnosticEvent, Event, MediaQualityStats, MediaSecurityFailure,
+    MediaSecurityKeying, MediaSecurityProfile, MediaSecurityState, RenegotiationFailure,
+    SdesNegotiationFailure, SipTrace, SipTraceConfig, SipTraceDirection, SubscriptionState,
+    TransferKind, TransferTargetEvidence,
 };
 pub use api::lifecycle::NegotiatedMedia;
 
@@ -681,15 +681,14 @@ pub mod prelude {
         EndpointNetworkConfig, EndpointProfile, EndpointProfileName, EndpointRegistrationInfo,
         EndpointRegistrationStatus, EndpointSipTrace, EndpointSrtpMode, EndpointTransport, Event,
         EventReceiver, HeaderName, IncomingCall, IncomingCallGuard, MediaMode, MediaPoolConfig,
-        MediaSecurityKeying, MediaSecurityProfile, MediaSecurityState,
+        MediaSecurityFailure, MediaSecurityKeying, MediaSecurityProfile, MediaSecurityState,
         MediaSessionControllerConfig, NegotiatedMedia, PeerControl, PerformanceConfig,
-        PerformanceRecipeBook,
-        ProfiledSipAdapter, Registration, RegistrationHandle, RegistrationInfo, RegistrationStatus,
-        Result, RtpSessionBufferConfig, RtpTransportBufferConfig, SdesBase64Mode,
-        SdesBase64Padding, SdesNegotiationDiagnostic, SdesNegotiationFailureClass,
-        SdesNegotiationStage, SessionError, SessionHandle, SipAccount, SipAuthDecision,
-        SipAuthScheme, SipAuthService, SipAuthSource, SipClientAuth, SipContactMode,
-        SipDigestAuthService, SipEgressProfilePolicy, SipEgressProfileRegistration,
+        PerformanceRecipeBook, ProfiledSipAdapter, Registration, RegistrationHandle,
+        RegistrationInfo, RegistrationStatus, Result, RtpSessionBufferConfig,
+        RtpTransportBufferConfig, SdesBase64Mode, SdesBase64Padding, SdesNegotiationDiagnostic,
+        SdesNegotiationFailureClass, SdesNegotiationStage, SessionError, SessionHandle, SipAccount,
+        SipAuthDecision, SipAuthScheme, SipAuthService, SipAuthSource, SipClientAuth,
+        SipContactMode, SipDigestAuthService, SipEgressProfilePolicy, SipEgressProfileRegistration,
         SipInitialHeaders, SipOriginateContext, SipProfileRevision, SipProfileSrtpPolicy,
         SipReason, SipRuntimeConfig, SipTlsMode, SipTrace, SipTraceConfig, SipTraceDirection,
         SrtpKeyingMode, SrtpSuitePolicy, StreamPeer, StreamPeerBuilder, SubscriptionState,

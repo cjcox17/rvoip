@@ -854,7 +854,7 @@ mod tests;
 // Re-export important types
 pub use audio_generation::{AudioSource, AudioTransmitterConfig};
 pub use bridge::{BridgeError, BridgeHandle, BridgeMode};
-pub use statistics::{DtlsState, DtlsStatus, MediaDiagnostics};
+pub use statistics::{DtlsFailure, DtlsState, DtlsStatus, MediaDiagnostics};
 pub use types::{
     AdvancedProcessorConfig, AdvancedProcessorSet, MediaConfig, MediaSessionEvent,
     MediaSessionInfo, MediaSessionStatus, AMR_DTX_PARAMETER, NEGOTIATED_FMTP_PARAMETER,
@@ -2124,13 +2124,14 @@ impl MediaSessionController {
             DtlsRole::Client => "client",
             DtlsRole::Server => "server",
         };
-        let status = |state| statistics::DtlsStatus {
+        let status = |state, failure| statistics::DtlsStatus {
             role: role_name,
             state,
+            failure,
         };
         self.dtls_status.insert(
             dialog_id.clone(),
-            status(statistics::DtlsState::Handshaking),
+            status(statistics::DtlsState::Handshaking, None),
         );
         let result = self
             .run_dtls_handshake_and_install_inner(
@@ -2146,12 +2147,12 @@ impl MediaSessionController {
         // Only the dialog's current entry is updated: a stopped dialog's
         // side state is gone and must not be recreated.
         if let Some(mut entry) = self.dtls_status.get_mut(dialog_id) {
-            *entry = status(match &result {
-                Ok(_) => statistics::DtlsState::Connected,
-                Err(_) => statistics::DtlsState::Failed,
-            });
+            *entry = match &result {
+                Ok(_) => status(statistics::DtlsState::Connected, None),
+                Err((failure, _)) => status(statistics::DtlsState::Failed, Some(*failure)),
+            };
         }
-        result
+        result.map_err(|(_, error)| error)
     }
 
     #[cfg(feature = "dtls-srtp")]
@@ -2165,12 +2166,17 @@ impl MediaSessionController {
         expected_remote_fingerprint_sha256: [u8; 32],
         srtp_profiles: Vec<rtp_core::dtls_srtp::SrtpProtectionProfile>,
         timeout: std::time::Duration,
-    ) -> Result<rtp_core::dtls_srtp::DtlsSrtpHandshakeResult> {
+    ) -> std::result::Result<
+        rtp_core::dtls_srtp::DtlsSrtpHandshakeResult,
+        (statistics::DtlsFailure, Error),
+    > {
+        use statistics::DtlsFailure;
+        let setup = |error: Error| (DtlsFailure::Setup, error);
         let session_arc = self
             .rtp_sessions
             .get(dialog_id)
             .map(|r| r.value().session.clone())
-            .ok_or_else(|| Error::session_not_found(dialog_id.as_str()))?;
+            .ok_or_else(|| setup(Error::session_not_found(dialog_id.as_str())))?;
 
         let conn = {
             let session_guard = session_arc.lock().await;
@@ -2179,10 +2185,10 @@ impl MediaSessionController {
                 .as_any()
                 .downcast_ref::<rtp_core::transport::UdpRtpTransport>()
                 .ok_or_else(|| {
-                    Error::config(
+                    setup(Error::config(
                         "run_dtls_handshake_and_install: RTP session is not a UdpRtpTransport"
                             .to_string(),
-                    )
+                    ))
                 })?;
             // Do not overwrite an ICE-nominated remote address with the
             // SDP default. ICE retargets the RTP transport as soon as a pair
@@ -2194,7 +2200,7 @@ impl MediaSessionController {
             }
             udp_transport
                 .dtls_conn_adapter()
-                .map_err(|e| Error::config(format!("dtls_conn_adapter: {e}")))?
+                .map_err(|e| setup(Error::config(format!("dtls_conn_adapter: {e}"))))?
         };
 
         let handshake = async {
@@ -2210,8 +2216,18 @@ impl MediaSessionController {
 
         let result = tokio::time::timeout(timeout, handshake)
             .await
-            .map_err(|_| Error::config("DTLS-SRTP handshake timed out".to_string()))?
-            .map_err(|e| Error::config(format!("DTLS-SRTP handshake failed: {e}")))?;
+            .map_err(|_| {
+                (
+                    DtlsFailure::Timeout,
+                    Error::config("DTLS-SRTP handshake timed out".to_string()),
+                )
+            })?
+            .map_err(|e| {
+                (
+                    DtlsFailure::Handshake,
+                    Error::config(format!("DTLS-SRTP handshake failed: {e}")),
+                )
+            })?;
 
         // Authenticate the peer certificate before deriving or installing any
         // media context. A mismatch leaves the already-latched transport with
@@ -2219,7 +2235,8 @@ impl MediaSessionController {
         verify_dtls_fingerprint(
             result.remote_fingerprint_sha256,
             expected_remote_fingerprint_sha256,
-        )?;
+        )
+        .map_err(|error| (DtlsFailure::FingerprintMismatch, error))?;
 
         let (send_key, recv_key) = match role {
             DtlsRole::Client => (
@@ -2231,13 +2248,22 @@ impl MediaSessionController {
                 result.client_write_key.clone(),
             ),
         };
-        let send_ctx = rtp_core::srtp::SrtpContext::new(result.profile.clone(), send_key)
-            .map_err(|e| Error::config(format!("building DTLS-SRTP send context: {e}")))?;
-        let recv_ctx = rtp_core::srtp::SrtpContext::new(result.profile.clone(), recv_key)
-            .map_err(|e| Error::config(format!("building DTLS-SRTP recv context: {e}")))?;
+        let send_ctx =
+            rtp_core::srtp::SrtpContext::new(result.profile.clone(), send_key).map_err(|e| {
+                setup(Error::config(format!(
+                    "building DTLS-SRTP send context: {e}"
+                )))
+            })?;
+        let recv_ctx =
+            rtp_core::srtp::SrtpContext::new(result.profile.clone(), recv_key).map_err(|e| {
+                setup(Error::config(format!(
+                    "building DTLS-SRTP recv context: {e}"
+                )))
+            })?;
 
         self.install_srtp_contexts(dialog_id, send_ctx, recv_ctx)
-            .await?;
+            .await
+            .map_err(setup)?;
         info!("Installed DTLS-SRTP contexts on dialog {}", dialog_id);
 
         Ok(result)

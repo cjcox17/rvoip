@@ -374,6 +374,33 @@ impl MediaSessionController {
         Ok(())
     }
 
+    /// Send a dialog's media to the address ICE nominated and keep it there:
+    /// later SDP commits ([`Self::establish_media_flow`],
+    /// [`Self::update_media`](super::MediaSessionController::update_media))
+    /// record their address as signalled but do not move media off the
+    /// nominated pair until the transport's ICE hold is cleared
+    /// ([`UdpRtpTransport::clear_ice_selected_rtp_addr`](rvoip_rtp_core::transport::UdpRtpTransport::clear_ice_selected_rtp_addr)).
+    pub async fn establish_ice_media_flow(
+        &self,
+        dialog_id: &DialogId,
+        remote_addr: SocketAddr,
+    ) -> Result<()> {
+        let transport = self
+            .ice_transport(dialog_id)
+            .await
+            .ok_or_else(|| Error::session_not_found(dialog_id.as_str()))?;
+        let udp = transport
+            .as_any()
+            .downcast_ref::<rvoip_rtp_core::transport::UdpRtpTransport>()
+            .ok_or_else(|| Error::config("ICE media flow needs a UDP RTP transport".to_string()))?;
+        udp.set_ice_selected_rtp_addr(remote_addr);
+        debug!(
+            "ICE-selected media destination set for dialog {}: {}",
+            dialog_id, remote_addr
+        );
+        self.start_audio_transmission(dialog_id).await
+    }
+
     /// Terminate media flow (called when call ends)
     pub async fn terminate_media_flow(&self, dialog_id: &DialogId) -> Result<()> {
         info!("🛑 Terminating media flow for dialog: {}", dialog_id);

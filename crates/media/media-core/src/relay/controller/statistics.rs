@@ -27,6 +27,36 @@ pub enum DtlsState {
     Failed,
 }
 
+/// Why a DTLS-SRTP handshake failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtlsFailure {
+    /// No handshake completed before the deadline: typically the peer never
+    /// received this side's flights (they went to an address the peer is
+    /// not on) or never sent its own.
+    Timeout,
+    /// The DTLS engine failed the handshake (an alert from the peer, or a
+    /// protocol error).
+    Handshake,
+    /// The handshake completed but the peer's certificate does not match
+    /// the fingerprint its SDP carried.
+    FingerprintMismatch,
+    /// The handshake could not start or its keys could not be installed.
+    Setup,
+}
+
+impl DtlsFailure {
+    /// A stable lowercase name for logs and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Handshake => "handshake",
+            Self::FingerprintMismatch => "fingerprint-mismatch",
+            Self::Setup => "setup",
+        }
+    }
+}
+
 /// A dialog's DTLS role (`client` | `server`) and handshake progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DtlsStatus {
@@ -34,6 +64,8 @@ pub struct DtlsStatus {
     pub role: &'static str,
     /// Handshake progress.
     pub state: DtlsState,
+    /// Why the handshake failed, when `state` is [`DtlsState::Failed`].
+    pub failure: Option<DtlsFailure>,
 }
 
 /// A snapshot of one dialog's media plumbing, for diagnosing a leg that
@@ -48,10 +80,22 @@ pub struct MediaDiagnostics {
     pub local_addr: Option<std::net::SocketAddr>,
     /// Local address of the separate RTCP socket (non-mux legs only).
     pub local_rtcp_addr: Option<std::net::SocketAddr>,
-    /// The peer's signalled RTP address (SDP or ICE).
+    /// The peer's SDP-signalled RTP address (the default `c=`/`m=`
+    /// address of the last committed offer/answer).
     pub signalled_remote_addr: Option<std::net::SocketAddr>,
-    /// Where RTP is sent now (signalled, or learned by symmetric RTP).
+    /// Where RTP is sent now (signalled, ICE-nominated, or learned by
+    /// symmetric RTP).
     pub current_remote_addr: Option<std::net::SocketAddr>,
+    /// Whether ICE nominated a pair that now governs where media goes.
+    pub ice_selected: bool,
+    /// Whether media goes to the SDP-signalled address
+    /// (`current_remote_addr == signalled_remote_addr`). `false` is normal
+    /// when ICE nominated another address or symmetric RTP learned one.
+    pub remote_matches_signalled: bool,
+    /// DTLS datagrams that arrived before the DTLS handshake started (they
+    /// are dropped and the peer must retransmit); `None` before a handshake
+    /// started or without DTLS.
+    pub dtls_datagrams_before_handshake: Option<u64>,
     /// Whether the transport only carries SRTP.
     pub secure_media_required: bool,
     /// Whether SRTP contexts are installed.
@@ -99,7 +143,7 @@ impl MediaSessionController {
         let (signalled_remote_addr, current_remote_addr, secure, srtp_active, receiving) = match udp
         {
             Some(udp) => (
-                udp.signalled_rtp_addr(),
+                udp.sdp_rtp_addr().or_else(|| udp.signalled_rtp_addr()),
                 udp.remote_rtp_addr().await,
                 udp.is_secure_media_required(),
                 udp.srtp_enabled().await,
@@ -112,12 +156,19 @@ impl MediaSessionController {
         let symmetric_rtp = udp
             .map(|udp| udp.symmetric_rtp_diagnostics())
             .unwrap_or_default();
+        let ice_selected = udp.is_some_and(|udp| udp.ice_selected_rtp_addr().is_some());
+        let dtls_datagrams_before_handshake =
+            udp.and_then(|udp| udp.dtls_datagrams_before_handshake());
         let bridge = self.bridges.info(dialog_id);
         Some(MediaDiagnostics {
             local_addr,
             local_rtcp_addr,
             signalled_remote_addr,
             current_remote_addr,
+            ice_selected,
+            remote_matches_signalled: current_remote_addr.is_some()
+                && current_remote_addr == signalled_remote_addr,
+            dtls_datagrams_before_handshake,
             secure_media_required: secure,
             srtp_active,
             transport_receiving: receiving,
@@ -761,5 +812,94 @@ mod tests {
         // Cleanup
         controller.stop_media(&dialog_id_1).await.unwrap();
         controller.stop_media(&dialog_id_2).await.unwrap();
+    }
+
+    /// A DTLS handshake that never hears from its peer reports why it
+    /// failed and what the transport saw, with no addresses needed.
+    #[cfg(feature = "dtls-srtp")]
+    #[tokio::test]
+    async fn a_dtls_timeout_is_reported_with_the_transport_view() {
+        use rvoip_rtp_core::dtls_srtp::{default_srtp_profiles, generate_identity};
+
+        let controller = MediaSessionController::new();
+        let dialog = DialogId::new("dtls-timeout-diagnostics");
+        controller
+            .start_media(
+                dialog.clone(),
+                MediaConfig {
+                    local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                    remote_addr: None,
+                    preferred_codec: Some("PCMU".to_string()),
+                    parameters: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let port = controller
+            .get_session_info(&dialog)
+            .await
+            .and_then(|info| info.rtp_port)
+            .unwrap();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+        // Two DTLS records (first byte 22) arrive before any handshake.
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for _ in 0..2 {
+            peer.send_to(&[22, 0xfe, 0xfd, 0, 0], local).await.unwrap();
+        }
+        let silent: SocketAddr = "192.0.2.10:9".parse().unwrap();
+        controller
+            .establish_media_flow(&dialog, silent)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while controller
+            .media_diagnostics(&dialog)
+            .await
+            .unwrap()
+            .receive
+            .dtls_dropped
+            < 2
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "DTLS datagrams not counted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let result = controller
+            .run_dtls_handshake_and_install(
+                &dialog,
+                generate_identity().unwrap(),
+                crate::relay::controller::DtlsRole::Server,
+                silent,
+                [0; 32],
+                default_srtp_profiles(),
+                std::time::Duration::from_millis(300),
+            )
+            .await;
+        assert!(result.is_err());
+
+        let diagnostics = controller.media_diagnostics(&dialog).await.unwrap();
+        let dtls = diagnostics.dtls.expect("DTLS status");
+        assert_eq!(dtls.state, DtlsState::Failed);
+        assert_eq!(dtls.failure, Some(DtlsFailure::Timeout));
+        assert_eq!(diagnostics.dtls_datagrams_before_handshake, Some(2));
+        assert!(!diagnostics.ice_selected);
+        assert!(diagnostics.remote_matches_signalled);
+
+        // An ICE nomination moves media off the signalled address.
+        let nominated: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        controller
+            .establish_ice_media_flow(&dialog, nominated)
+            .await
+            .unwrap();
+        let diagnostics = controller.media_diagnostics(&dialog).await.unwrap();
+        assert!(diagnostics.ice_selected);
+        assert!(!diagnostics.remote_matches_signalled);
+        assert_eq!(diagnostics.signalled_remote_addr, Some(silent));
+        assert_eq!(diagnostics.current_remote_addr, Some(nominated));
+        controller.stop_media(&dialog).await.unwrap();
     }
 }
