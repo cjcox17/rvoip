@@ -297,6 +297,14 @@ impl IceRuntimes {
         })
     }
 
+    /// Whether the session's agent has the peer's material already (a
+    /// renegotiation rather than the first exchange).
+    pub(crate) fn has_remote(&self, session_id: &SessionId) -> bool {
+        self.runtimes
+            .get(session_id)
+            .is_some_and(|runtime| runtime.remote.is_some())
+    }
+
     /// The session's committed local material, if a runtime exists.
     pub(crate) fn local_material(&self, session_id: &SessionId) -> Option<IceMaterial> {
         self.runtimes

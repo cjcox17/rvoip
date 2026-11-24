@@ -1219,6 +1219,10 @@ pub struct MediaSessionController {
     bridges: Arc<bridge::BridgeRegistry>,
     /// DTLS-SRTP handshake role and progress per dialog, for diagnostics.
     pub(super) dtls_status: Arc<DashMap<DialogId, statistics::DtlsStatus>>,
+    /// One DTLS handshake at a time per dialog: a re-handshake and a
+    /// re-offer's new association run one after the other, so neither can
+    /// steal the other's datagrams or record its result last.
+    dtls_handshake_locks: Arc<DashMap<DialogId, Arc<tokio::sync::Mutex<()>>>>,
 
     /// Sprint 3.6 C1 follow-up — RFC 3389 comfort-noise gate state per
     /// dialog. Lazily populated on first audio frame for sessions
@@ -1371,6 +1375,7 @@ impl MediaSessionController {
             rtp_bridge,
             bridges: Arc::default(),
             dtls_status: Arc::new(DashMap::new()),
+            dtls_handshake_locks: Arc::new(DashMap::new()),
             cn_gate_state: Arc::new(DashMap::with_capacity(capacity_hint)),
             comfort_noise_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             media_directions: Arc::new(DashMap::with_capacity(capacity_hint)),
@@ -1704,6 +1709,7 @@ impl MediaSessionController {
             rtp_bridge,
             bridges: Arc::default(),
             dtls_status: Arc::new(DashMap::new()),
+            dtls_handshake_locks: Arc::new(DashMap::new()),
             cn_gate_state: Arc::new(DashMap::new()),
             comfort_noise_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             media_directions: Arc::new(DashMap::new()),
@@ -2135,6 +2141,81 @@ impl MediaSessionController {
         srtp_profiles: Vec<rtp_core::dtls_srtp::SrtpProtectionProfile>,
         timeout: std::time::Duration,
     ) -> Result<rtp_core::dtls_srtp::DtlsSrtpHandshakeResult> {
+        self.run_dtls_handshake_mode(
+            dialog_id,
+            identity,
+            role,
+            remote_addr,
+            expected_remote_fingerprint_sha256,
+            srtp_profiles,
+            timeout,
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::run_dtls_handshake_and_install`] for a peer that starts a new
+    /// handshake on an association whose keys are installed and working.
+    /// On success the new keys replace them. On failure (a timeout, a wrong
+    /// certificate) nothing changes: the installed keys keep carrying the
+    /// call, the DTLS status returns to what it was, and the transport goes
+    /// back to reporting new ClientHellos.
+    #[cfg(feature = "dtls-srtp")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_dtls_rehandshake_and_install(
+        &self,
+        dialog_id: &DialogId,
+        identity: rtp_core::dtls_srtp::DtlsIdentity,
+        role: DtlsRole,
+        remote_addr: std::net::SocketAddr,
+        expected_remote_fingerprint_sha256: [u8; 32],
+        srtp_profiles: Vec<rtp_core::dtls_srtp::SrtpProtectionProfile>,
+        timeout: std::time::Duration,
+    ) -> Result<rtp_core::dtls_srtp::DtlsSrtpHandshakeResult> {
+        self.run_dtls_handshake_mode(
+            dialog_id,
+            identity,
+            role,
+            remote_addr,
+            expected_remote_fingerprint_sha256,
+            srtp_profiles,
+            timeout,
+            true,
+        )
+        .await
+    }
+
+    #[cfg(feature = "dtls-srtp")]
+    async fn mark_dtls_established(&self, dialog_id: &DialogId) {
+        if let Some(transport) = self.ice_transport(dialog_id).await {
+            if let Some(udp) = transport
+                .as_any()
+                .downcast_ref::<rtp_core::transport::UdpRtpTransport>()
+            {
+                udp.mark_dtls_established();
+            }
+        }
+    }
+
+    #[cfg(feature = "dtls-srtp")]
+    #[allow(clippy::too_many_arguments)]
+    async fn run_dtls_handshake_mode(
+        &self,
+        dialog_id: &DialogId,
+        identity: rtp_core::dtls_srtp::DtlsIdentity,
+        role: DtlsRole,
+        remote_addr: std::net::SocketAddr,
+        expected_remote_fingerprint_sha256: [u8; 32],
+        srtp_profiles: Vec<rtp_core::dtls_srtp::SrtpProtectionProfile>,
+        timeout: std::time::Duration,
+        rehandshake: bool,
+    ) -> Result<rtp_core::dtls_srtp::DtlsSrtpHandshakeResult> {
+        let lock = self
+            .dtls_handshake_locks
+            .entry(dialog_id.clone())
+            .or_default()
+            .clone();
+        let _serialized = lock.lock().await;
         let role_name = match role {
             DtlsRole::Client => "client",
             DtlsRole::Server => "server",
@@ -2144,6 +2225,10 @@ impl MediaSessionController {
             state,
             failure,
         };
+        let previous = self
+            .dtls_status
+            .get(dialog_id)
+            .map(|entry| entry.value().clone());
         self.dtls_status.insert(
             dialog_id.clone(),
             status(statistics::DtlsState::Handshaking, None),
@@ -2159,23 +2244,19 @@ impl MediaSessionController {
                 timeout,
             )
             .await;
-        if result.is_ok() {
-            // A ClientHello from now on is a new handshake by the peer.
-            if let Some(transport) = self.ice_transport(dialog_id).await {
-                if let Some(udp) = transport
-                    .as_any()
-                    .downcast_ref::<rtp_core::transport::UdpRtpTransport>()
-                {
-                    udp.mark_dtls_established();
-                }
-            }
+        // A ClientHello from now on is a new handshake by the peer: after a
+        // success, and after a failed re-handshake (the old keys still
+        // carry the call).
+        if result.is_ok() || rehandshake {
+            self.mark_dtls_established(dialog_id).await;
         }
         // Only the dialog's current entry is updated: a stopped dialog's
         // side state is gone and must not be recreated.
         if let Some(mut entry) = self.dtls_status.get_mut(dialog_id) {
-            *entry = match &result {
-                Ok(_) => status(statistics::DtlsState::Connected, None),
-                Err((failure, _)) => status(statistics::DtlsState::Failed, Some(*failure)),
+            *entry = match (&result, rehandshake, previous) {
+                (Ok(_), _, _) => status(statistics::DtlsState::Connected, None),
+                (Err(_), true, Some(previous)) => previous,
+                (Err((failure, _)), _, _) => status(statistics::DtlsState::Failed, Some(*failure)),
             };
         }
         result.map_err(|(_, error)| error)
@@ -2303,6 +2384,7 @@ impl MediaSessionController {
         self.cn_gate_state.remove(dialog_id);
         self.codec_runtimes.remove(dialog_id);
         self.dtls_status.remove(dialog_id);
+        self.dtls_handshake_locks.remove(dialog_id);
 
         let media_id = MediaSessionId::from_dialog(dialog_id);
         if let Some((_, session_id)) = self.media_to_session.remove(&media_id) {
