@@ -7,10 +7,12 @@
 //! Requirements enforced at [`MediaSessionController::bridge_sessions`]:
 //!
 //! - Both sessions must already have a remote RTP address (media flow ready).
-//! - Both sessions must have negotiated the same RTP payload type. Mismatches
-//!   return [`BridgeError::CodecMismatch`] — no transcoding is performed.
+//! - Both sessions must have negotiated the same codec. Mismatches return
+//!   [`BridgeError::CodecMismatch`] — no transcoding is performed. The clock
+//!   rate and channel count must match too ([`BridgeError::FormatMismatch`]).
+//!   The payload type *number* need not: it is mapped per leg.
 //! - Both sessions must agree on any format parameters that change the wire
-//!   bytes. A matching payload type is **not** sufficient for every codec:
+//!   bytes. The same codec is **not** sufficient for every codec:
 //!   two AMR legs can share a payload type while one uses RFC 4867
 //!   bandwidth-efficient framing and the other octet-aligned, which are
 //!   different bit layouts. Forwarding between them delivers payloads the far
@@ -23,8 +25,14 @@
 //! so switching the leg between its own audio and bridged audio (or from one
 //! bridge to the next) never moves its stream backwards.
 //!
-//! DTMF (RFC 2833) packets ride the same stream and are forwarded
-//! transparently. RTCP is not bridged — each leg keeps generating its own
+//! Each leg keeps its own payload type numbers: the relay maps the source
+//! leg's negotiated audio payload type to the destination leg's, so two legs
+//! that gave a dynamic codec different numbers still relay.
+//!
+//! RFC 4733 telephone-events are not relayed: the RTP transport delivers
+//! them as typed DTMF events, not as packets, so they never reach the
+//! forwarder. An application relays a digit by sending it on the other leg.
+//! RTCP is not bridged — each leg keeps generating its own
 //! reports (RFC 3550 §7.2 compliance).
 //!
 //! The returned [`BridgeHandle`] tears the bridge down on drop: the cancel
@@ -71,8 +79,9 @@ pub(super) const TELEPHONE_EVENT_PAYLOAD_TYPE: u8 = 101;
 /// so two legs that agreed different codecs with their peers can still talk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeMode {
-    /// Forward RTP payloads unchanged. Requires both legs to share a payload
-    /// type and an interchangeable wire format. Timestamps keep their
+    /// Forward RTP payloads unchanged. Requires both legs to have negotiated
+    /// the same codec, clock rate and channel count with an interchangeable
+    /// wire format; the payload type number is mapped per leg. Timestamps keep their
     /// relative timing but are rebased onto the destination's own outgoing
     /// timeline (see [`TimelineSource`]).
     Relay,
@@ -248,7 +257,8 @@ impl MediaSessionController {
     /// Bridge two existing media sessions at the RTP packet level.
     ///
     /// Both sessions must be ready (have a remote address) and must have
-    /// negotiated the same payload type. While bridged, inbound RTP from
+    /// negotiated the same codec and wire format (payload type numbers may
+    /// differ; they are mapped per leg). While bridged, inbound RTP from
     /// session A is forwarded as outbound RTP on session B (and vice versa)
     /// without decoding.
     ///
@@ -292,33 +302,22 @@ impl MediaSessionController {
         }
 
         // Preflight: both sessions exist and have remote addresses.
-        let (a_session_arc, a_pt, a_fmtp, a_name) = self.read_bridge_preconditions(&a).await?;
-        let (b_session_arc, b_pt, b_fmtp, b_name) = self.read_bridge_preconditions(&b).await?;
+        let (a_session_arc, a_pt, _, a_name) = self.read_bridge_preconditions(&a).await?;
+        let (b_session_arc, _, _, b_name) = self.read_bridge_preconditions(&b).await?;
 
-        if mode == BridgeMode::Relay {
-            if a_pt != b_pt {
-                return Err(BridgeError::CodecMismatch {
-                    a: a.to_string(),
-                    b: b.to_string(),
-                    a_pt,
-                    b_pt,
-                });
-            }
-
-            // A matching payload type does not imply interchangeable payloads.
-            // AMR is the case that forces this: the same payload type carries
-            // either bandwidth-efficient or octet-aligned framing depending on
-            // `octet-align`, and those are different bit layouts. Relaying across
-            // the boundary would hand the far end bytes it cannot parse.
-            if !wire_formats_are_interchangeable(&a_name, &a_fmtp, &b_name, &b_fmtp) {
-                return Err(BridgeError::FormatMismatch {
-                    a: a.to_string(),
-                    b: b.to_string(),
-                    payload_type: a_pt,
-                    a_fmtp,
-                    b_fmtp,
-                });
-            }
+        let (a_pt, b_pt) = if mode == BridgeMode::Relay {
+            // Compare what each leg negotiated (codec, clock, channels,
+            // framing), not payload type numbers: dynamic payload types are
+            // chosen per leg, and the forwarder maps them.
+            let format = |id: &DialogId| {
+                self.codec_runtimes
+                    .get(id)
+                    .map(|entry| entry.value().format.clone())
+                    .ok_or_else(|| BridgeError::SessionNotFound(id.to_string()))
+            };
+            let (a_format, b_format) = (format(&a)?, format(&b)?);
+            check_relay_formats(&a, &a_format, &b, &b_format)?;
+            (a_format.payload_type, b_format.payload_type)
         } else {
             // Transcode: both legs must have an encodable/decodable codec
             // runtime. Resolve both up front so an unsupported combination
@@ -350,7 +349,8 @@ impl MediaSessionController {
                     });
                 }
             }
-        }
+            (a_runtime.format.payload_type, b_runtime.format.payload_type)
+        };
 
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -401,6 +401,8 @@ impl MediaSessionController {
                         a_subscriber,
                         b_session_arc.clone(),
                         b_send_handle,
+                        Arc::clone(&self.codec_runtimes),
+                        Arc::clone(&self.comfort_noise_enabled),
                         cancel.clone(),
                     ),
                 ));
@@ -412,6 +414,8 @@ impl MediaSessionController {
                         b_subscriber,
                         a_session_arc.clone(),
                         a_send_handle,
+                        Arc::clone(&self.codec_runtimes),
+                        Arc::clone(&self.comfort_noise_enabled),
                         cancel.clone(),
                     ),
                 ));
@@ -572,8 +576,8 @@ impl MediaSessionController {
     ///
     /// # Errors
     ///
-    /// When the proposed config's payload type or transport-format parameters
-    /// would no longer match the partner's. The caller must reject the update
+    /// When the proposed config's codec, clock rate, channel count or
+    /// transport-format parameters would no longer match the partner's. The caller must reject the update
     /// rather than apply it: a bridge relaying the wrong framing is worse than
     /// a re-INVITE that fails, because it is not diagnosable from either end.
     pub(super) fn revalidate_bridge_format(
@@ -588,55 +592,75 @@ impl MediaSessionController {
             return Ok(());
         }
 
-        let shape = |config: &MediaConfig| {
-            let pt = config
-                .preferred_codec
-                .as_ref()
-                .and_then(|codec| self.codec_mapper.codec_to_payload(codec))
-                .unwrap_or(0);
-            let fmtp = config
-                .parameters
-                .get(NEGOTIATED_FMTP_PARAMETER)
-                .cloned()
-                .unwrap_or_default();
-            (pt, fmtp, config.preferred_codec.clone().unwrap_or_default())
+        // A config the codec layer cannot resolve is refused by the update
+        // itself; there is no format to compare here.
+        let Ok(proposed) = super::codec_runtime::resolve_codec(proposed) else {
+            return Ok(());
         };
-
-        let (proposed_pt, proposed_fmtp, proposed_name) = shape(proposed);
-        let Some((partner_pt, partner_fmtp, partner_name)) = self
-            .sessions
+        let Some(partner_format) = self
+            .codec_runtimes
             .get(&partner)
-            .map(|entry| shape(&entry.value().config))
+            .map(|entry| entry.value().format.clone())
         else {
             // The partner vanished between the lookup and here. Nothing to
             // relay to, so nothing to protect.
             return Ok(());
         };
-
-        if proposed_pt != partner_pt {
-            return Err(BridgeError::CodecMismatch {
-                a: dialog_id.to_string(),
-                b: partner.to_string(),
-                a_pt: proposed_pt,
-                b_pt: partner_pt,
-            });
-        }
-        if !wire_formats_are_interchangeable(
-            &proposed_name,
-            &proposed_fmtp,
-            &partner_name,
-            &partner_fmtp,
-        ) {
-            return Err(BridgeError::FormatMismatch {
-                a: dialog_id.to_string(),
-                b: partner.to_string(),
-                payload_type: proposed_pt,
-                a_fmtp: proposed_fmtp,
-                b_fmtp: partner_fmtp,
-            });
-        }
-        Ok(())
+        check_relay_formats(dialog_id, &proposed, &partner, &partner_format)
     }
+}
+
+/// Whether two legs' negotiated audio formats can be relayed byte for byte.
+///
+/// Payload type *numbers* are not compared: a dynamic codec (Opus, AMR) gets
+/// its number per leg, and the relay maps it. What must match is what the
+/// bytes mean: the codec, its clock rate and channel count, and any format
+/// parameter that changes the framing.
+fn check_relay_formats(
+    a: &DialogId,
+    a_format: &super::types::NegotiatedAudioCodec,
+    b: &DialogId,
+    b_format: &super::types::NegotiatedAudioCodec,
+) -> std::result::Result<(), BridgeError> {
+    if normalized_codec_name(&a_format.name) != normalized_codec_name(&b_format.name) {
+        return Err(BridgeError::CodecMismatch {
+            a: a.to_string(),
+            b: b.to_string(),
+            a_pt: a_format.payload_type,
+            b_pt: b_format.payload_type,
+        });
+    }
+    let a_fmtp = a_format.fmtp.clone().unwrap_or_default();
+    let b_fmtp = b_format.fmtp.clone().unwrap_or_default();
+    if a_format.clock_rate != b_format.clock_rate || a_format.channels != b_format.channels {
+        return Err(BridgeError::FormatMismatch {
+            a: a.to_string(),
+            b: b.to_string(),
+            payload_type: a_format.payload_type,
+            a_fmtp: format!(
+                "{}/{}/{} {a_fmtp}",
+                a_format.name, a_format.clock_rate, a_format.channels
+            ),
+            b_fmtp: format!(
+                "{}/{}/{} {b_fmtp}",
+                b_format.name, b_format.clock_rate, b_format.channels
+            ),
+        });
+    }
+    // The same codec does not imply interchangeable payloads. AMR is the
+    // case that forces this: bandwidth-efficient and octet-aligned framing
+    // are different bit layouts, selected by `octet-align`. Relaying across
+    // the boundary would hand the far end bytes it cannot parse.
+    if !wire_formats_are_interchangeable(&a_format.name, &a_fmtp, &b_format.name, &b_fmtp) {
+        return Err(BridgeError::FormatMismatch {
+            a: a.to_string(),
+            b: b.to_string(),
+            payload_type: a_format.payload_type,
+            a_fmtp,
+            b_fmtp,
+        });
+    }
+    Ok(())
 }
 
 /// Whether two negotiated `a=fmtp` strings describe the same wire format.
@@ -745,6 +769,8 @@ async fn forward_rtp(
     mut events: broadcast::Receiver<RtpSessionEvent>,
     dst_session: Arc<Mutex<RtpSession>>,
     dst_send_handle: Option<rvoip_rtp_core::RtpSendHandle>,
+    codec_runtimes: Arc<DashMap<DialogId, Arc<super::codec_runtime::DialogCodecRuntime>>>,
+    comfort_noise_enabled: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
 ) {
     debug!("🔗 bridge forwarder started: {} -> {}", src, dst);
@@ -758,10 +784,23 @@ async fn forward_rtp(
                 if cancel.load(Ordering::SeqCst) {
                     break;
                 }
-                let payload = packet.payload.clone();
                 let header = &packet.header;
+                let Some(pt) = relay_payload_type(
+                    header.payload_type,
+                    &src,
+                    &dst,
+                    &codec_runtimes,
+                    comfort_noise_enabled.load(Ordering::Relaxed),
+                ) else {
+                    debug!(
+                        "bridge forward {}->{} dropped PT {} the destination did not negotiate",
+                        src, dst, header.payload_type
+                    );
+                    continue;
+                };
+                let payload = packet.payload.clone();
                 let source = origin.with_stream(header.ssrc);
-                let (ts, marker, pt) = (header.timestamp, header.marker, header.payload_type);
+                let (ts, marker) = (header.timestamp, header.marker);
                 let send_result = if let Some(handle) = &dst_send_handle {
                     handle
                         .send_packet_from(source, ts, payload, marker, pt)
@@ -791,6 +830,48 @@ async fn forward_rtp(
     }
     debug!("🔗 bridge forwarder exited: {} -> {}", src, dst);
 }
+
+/// The payload type a relayed packet is sent with on the destination leg, or
+/// `None` to drop it.
+///
+/// Each leg numbers its payloads as it negotiated them: a dynamic codec such
+/// as Opus may be 111 on one leg and 96 on the other. So the source leg's
+/// audio payload type becomes the destination leg's. Comfort noise (static
+/// PT 13) passes only where this controller sends comfort noise itself and
+/// the destination codec carries it, and telephone-events keep the one
+/// telephone-event payload type this layer uses. Anything else has no
+/// meaning the destination agreed to and is dropped rather than forwarded
+/// unmapped.
+fn relay_payload_type(
+    payload_type: u8,
+    src: &DialogId,
+    dst: &DialogId,
+    codec_runtimes: &DashMap<DialogId, Arc<super::codec_runtime::DialogCodecRuntime>>,
+    comfort_noise_enabled: bool,
+) -> Option<u8> {
+    let format = |id: &DialogId| {
+        codec_runtimes
+            .get(id)
+            .map(|entry| entry.value().format.clone())
+    };
+    let destination = format(dst)?;
+    if payload_type == format(src)?.payload_type {
+        return Some(destination.payload_type);
+    }
+    match payload_type {
+        COMFORT_NOISE_PAYLOAD_TYPE
+            if comfort_noise_enabled
+                && super::cn_gate::supports_rfc3389_comfort_noise(&destination.name) =>
+        {
+            Some(COMFORT_NOISE_PAYLOAD_TYPE)
+        }
+        TELEPHONE_EVENT_PAYLOAD_TYPE => Some(TELEPHONE_EVENT_PAYLOAD_TYPE),
+        _ => None,
+    }
+}
+
+/// RFC 3389 comfort noise, a static payload type.
+const COMFORT_NOISE_PAYLOAD_TYPE: u8 = 13;
 
 /// Scale successive ordered frame timestamps, carrying the fractional tick.
 #[derive(Default)]

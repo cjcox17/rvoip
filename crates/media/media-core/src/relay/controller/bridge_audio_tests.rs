@@ -348,3 +348,73 @@ async fn source_renegotiation_keeps_destination_timestamps_continuous() {
     controller.stop_media(&src).await.unwrap();
     controller.stop_media(&dst).await.unwrap();
 }
+
+/// Two legs that gave Opus different dynamic payload types still relay, and
+/// each leg receives the number it negotiated. A payload type the
+/// destination never agreed to is dropped rather than forwarded unmapped.
+#[tokio::test]
+async fn relay_maps_payload_type_to_destination_legs_negotiated_number() {
+    let peer_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let controller = MediaSessionController::new();
+    let (a, b) = (DialogId::new("relay-pt-a"), DialogId::new("relay-pt-b"));
+    controller
+        .start_media(
+            a.clone(),
+            config(peer_a.local_addr().unwrap(), "opus", 111, 48_000, 2),
+        )
+        .await
+        .unwrap();
+    controller
+        .start_media(
+            b.clone(),
+            config(peer_b.local_addr().unwrap(), "opus", 96, 48_000, 2),
+        )
+        .await
+        .unwrap();
+    let port_a = controller
+        .get_session_info(&a)
+        .await
+        .unwrap()
+        .rtp_port
+        .unwrap();
+    let bridge = controller
+        .bridge_sessions(a.clone(), b.clone())
+        .await
+        .expect("the same codec relays whatever number each leg gave it");
+
+    let (packets, _) = packets_and_reference();
+    let mut received = Vec::new();
+    let mut bytes = [0u8; 2048];
+    for (index, payload) in packets.iter().take(6).enumerate() {
+        // Every other packet carries a payload type nobody negotiated.
+        for pt in [111u8, 99] {
+            let packet = RtpPacket::new_with_payload(
+                pt,
+                (index * 2) as u16 + u16::from(pt == 99),
+                timestamp(index),
+                0x0101_0101,
+                payload.clone(),
+            );
+            peer_a
+                .send_to(&packet.serialize().unwrap(), ("127.0.0.1", port_a))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    while let Ok(Ok(len)) = timeout(Duration::from_millis(300), peer_b.recv(&mut bytes)).await {
+        if let Ok(packet) = RtpPacket::parse(&bytes[..len]) {
+            // RTCP shares the socket when multiplexed.
+            if packet.header.payload_type < 72 || packet.header.payload_type > 76 {
+                received.push(packet.header.payload_type);
+            }
+        }
+    }
+    drop(bridge);
+    assert!(received.len() >= 3, "relayed audio arrived: {received:?}");
+    assert!(
+        received.iter().all(|pt| *pt == 96),
+        "leg B receives only its own payload type: {received:?}"
+    );
+}
