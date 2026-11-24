@@ -18,6 +18,11 @@
 //!   returns [`BridgeError::FormatMismatch`].
 //! - Neither session may already be bridged to another session.
 //!
+//! Each leg sends on one outgoing RTP timeline: forwarded packets keep their
+//! relative timing but are rebased onto the destination leg's own timestamps,
+//! so switching the leg between its own audio and bridged audio (or from one
+//! bridge to the next) never moves its stream backwards.
+//!
 //! DTMF (RFC 2833) packets ride the same stream and are forwarded
 //! transparently. RTCP is not bridged — each leg keeps generating its own
 //! reports (RFC 3550 §7.2 compliance).
@@ -44,6 +49,7 @@ use crate::types::{DialogId, SampleRate};
 use rvoip_rtp_core::session::RtpSessionEvent;
 use rvoip_rtp_core::RtpSendHandle;
 use rvoip_rtp_core::RtpSession;
+use rvoip_rtp_core::TimelineSource;
 
 use super::codec_runtime::normalized_codec_name;
 use super::types::{MediaConfig, NEGOTIATED_FMTP_PARAMETER};
@@ -51,8 +57,8 @@ use super::{MediaSessionController, TranscodeInput, TranscodeInputs, RTP_REORDER
 
 /// RFC 4733 telephone-event payload type. Both legs of a bridged call
 /// advertise it at the 8 kHz telephone-event clock, so in transcode mode these
-/// packets are relayed verbatim (payload **and** timestamp) instead of being
-/// decoded as audio.
+/// packets are relayed with their payload unchanged instead of being decoded
+/// as audio.
 pub(super) const TELEPHONE_EVENT_PAYLOAD_TYPE: u8 = 101;
 
 /// How a bridge moves payloads between its two legs.
@@ -65,9 +71,10 @@ pub(super) const TELEPHONE_EVENT_PAYLOAD_TYPE: u8 = 101;
 /// so two legs that agreed different codecs with their peers can still talk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeMode {
-    /// Forward RTP payloads unchanged (payload, timestamp and marker all
-    /// preserved). Requires both legs to share a payload type and an
-    /// interchangeable wire format.
+    /// Forward RTP payloads unchanged. Requires both legs to share a payload
+    /// type and an interchangeable wire format. Timestamps keep their
+    /// relative timing but are rebased onto the destination's own outgoing
+    /// timeline (see [`TimelineSource`]).
     Relay,
     /// Decode → convert → re-encode per direction. Requires both codecs to be
     /// encodable/decodable by this build (feature-gated codecs like Opus need
@@ -267,8 +274,13 @@ impl MediaSessionController {
     /// decoded PCM to the *destination* leg's negotiated rate/channel shape,
     /// and re-encodes with the destination codec. Both codecs must be
     /// encodable/decodable in this build. RFC 4733 telephone-event packets
-    /// (payload type 101) are still relayed verbatim — both legs advertise the
-    /// 8 kHz telephone-event clock, so payload and timestamp pass through.
+    /// (payload type 101) are still relayed with their payload unchanged.
+    ///
+    /// In both modes the destination leg sends every packet on its one
+    /// outgoing RTP timeline: the forwarded audio keeps its relative timing,
+    /// but a switch between the leg's own audio, this bridge and any later
+    /// bridge never moves the leg's timestamps backwards, and is marked as
+    /// the start of a talkspurt (see [`TimelineSource`]).
     pub async fn bridge_sessions_with_mode(
         &self,
         a: DialogId,
@@ -713,10 +725,15 @@ fn g729_annexb(fmtp: &str) -> bool {
 }
 
 /// Forwarder task: subscribe to `src`'s RTP events and replay each inbound
-/// packet's payload+timestamp+marker as an outbound packet on `dst`.
+/// packet's payload, payload type, timestamp and marker as an outbound packet
+/// on `dst`.
 ///
-/// The destination RTP session assigns its own sequence number and SSRC —
-/// we only carry the timestamp, payload bytes, and marker bit.
+/// The destination RTP session assigns its own sequence number and SSRC, and
+/// it rebases the timestamp onto its one outgoing timeline. The forwarder is
+/// its own [`TimelineSource`], one stream per inbound SSRC, so whatever else
+/// the destination sends before, between or after (its own prompts, another
+/// bridge) the stream never steps back, while the relayed audio keeps its
+/// relative timing.
 ///
 /// If a lock-free `RtpSendHandle` was successfully snapshot at bridge
 /// setup, the per-packet send goes through it without locking
@@ -731,6 +748,7 @@ async fn forward_rtp(
     cancel: Arc<AtomicBool>,
 ) {
     debug!("🔗 bridge forwarder started: {} -> {}", src, dst);
+    let origin = TimelineSource::new_origin();
     loop {
         if cancel.load(Ordering::SeqCst) {
             break;
@@ -741,13 +759,18 @@ async fn forward_rtp(
                     break;
                 }
                 let payload = packet.payload.clone();
-                let ts = packet.header.timestamp;
-                let marker = packet.header.marker;
+                let header = &packet.header;
+                let source = origin.with_stream(header.ssrc);
+                let (ts, marker, pt) = (header.timestamp, header.marker, header.payload_type);
                 let send_result = if let Some(handle) = &dst_send_handle {
-                    handle.send_packet(ts, payload, marker).await
+                    handle
+                        .send_packet_from(source, ts, payload, marker, pt)
+                        .await
                 } else {
                     let dst_guard = dst_session.lock().await;
-                    dst_guard.send_packet(ts, payload, marker).await
+                    dst_guard
+                        .send_packet_from(source, ts, payload, marker, pt)
+                        .await
                 };
                 if let Err(e) = send_result {
                     warn!("bridge forward {}->{} send_packet failed: {}", src, dst, e);
@@ -826,6 +849,9 @@ async fn forward_rtp_transcode(
 ) {
     let mut converter = FormatConverter::new();
     let mut clock = TranscodeClock::default();
+    // Re-encoded audio is one stream on the transcode clock; relayed events
+    // are placed on the destination timeline by their own source.
+    let origin = TimelineSource::new_origin();
     while let Some(item) = input.recv().await {
         if cancel.load(Ordering::SeqCst) {
             break;
@@ -840,15 +866,28 @@ async fn forward_rtp_transcode(
                 {
                     continue;
                 }
+                let source = origin.with_stream(h.ssrc.max(1));
                 let result = if let Some(handle) = &dst_send_handle {
                     handle
-                        .send_packet_with_pt(h.timestamp, packet.payload, h.marker, h.payload_type)
+                        .send_packet_from(
+                            source,
+                            h.timestamp,
+                            packet.payload,
+                            h.marker,
+                            h.payload_type,
+                        )
                         .await
                 } else {
                     dst_session
                         .lock()
                         .await
-                        .send_packet_with_pt(h.timestamp, packet.payload, h.marker, h.payload_type)
+                        .send_packet_from(
+                            source,
+                            h.timestamp,
+                            packet.payload,
+                            h.marker,
+                            h.payload_type,
+                        )
                         .await
                 };
                 if let Err(e) = result {
@@ -887,7 +926,8 @@ async fn forward_rtp_transcode(
             let payload = bytes::Bytes::from(packet.payload);
             let result = if let Some(handle) = &dst_send_handle {
                 handle
-                    .send_packet_with_pt(
+                    .send_packet_from(
+                        origin,
                         packet.timestamp,
                         payload,
                         marker,
@@ -898,7 +938,8 @@ async fn forward_rtp_transcode(
                 dst_session
                     .lock()
                     .await
-                    .send_packet_with_pt(
+                    .send_packet_from(
+                        origin,
                         packet.timestamp,
                         payload,
                         marker,
@@ -1681,3 +1722,7 @@ mod tests {
 #[cfg(all(test, feature = "opus", feature = "pcmu", feature = "pcma"))]
 #[path = "bridge_audio_tests.rs"]
 mod bridge_audio_tests;
+
+#[cfg(all(test, feature = "pcmu", feature = "pcma"))]
+#[path = "bridge_timeline_tests.rs"]
+mod bridge_timeline_tests;
