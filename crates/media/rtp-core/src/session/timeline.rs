@@ -33,6 +33,9 @@ use std::time::{Duration, Instant};
 use crate::RtpTimestamp;
 
 /// Half the RTP timestamp space: the wrap-aware "is ahead" boundary.
+///
+/// A relayed source's step back of up to 300 ms (or three packets, if
+/// longer) is a late packet; a longer one is a clock reset.
 const HALF: u32 = 1 << 31;
 
 /// Which producer stamped a packet sent on a session.
@@ -219,7 +222,17 @@ impl OutgoingTimeline {
         let delta = timestamp.wrapping_sub(media.last_source);
         if delta >= HALF {
             let back = delta.wrapping_neg();
-            if back <= frame.saturating_mul(3) {
+            // A relayed source's packets can arrive out of order; the
+            // session's own producer sends in order, so any step back from
+            // it is a new clock.
+            let late_window = if source == TimelineSource::LOCAL {
+                0
+            } else {
+                frame
+                    .saturating_mul(3)
+                    .max(self.clock_rate.saturating_mul(3) / 10)
+            };
+            if back <= late_window {
                 // A packet the source sent earlier, arriving late. Keep its
                 // relative timing, and the stream's state, as they were.
                 return Mapped {
@@ -487,6 +500,33 @@ mod tests {
         assert_eq!(late, b + 160);
         let d = h.media(2_080, src, 40_000 + 16_000 + 480);
         assert_eq!(d - c, 160);
+    }
+
+    #[test]
+    fn a_deeply_late_relayed_packet_keeps_its_place_without_moving_the_source() {
+        let mut h = Harness::new(PCMU);
+        let src = TimelineSource::new_origin().with_stream(4);
+        let out = h.run(0, src, 70_000, 12);
+        // A packet from 200 ms (ten frames) back arrives now.
+        let late = h.media(240, src, 70_000 + 160);
+        assert_eq!(late, out[1]);
+        assert!(!h.sent.last().unwrap().1);
+        // The source goes on with its own spacing and no new marker.
+        let next = h.media(240, src, 70_000 + 12 * 160);
+        assert_eq!(next, out[11] + 160);
+        assert!(!h.sent.last().unwrap().1);
+    }
+
+    #[test]
+    fn a_step_back_from_the_local_producer_is_a_new_clock() {
+        let mut h = Harness::new(PCMU);
+        let out = h.run(0, TimelineSource::LOCAL, 90_000, 3);
+        // A prompt restarting its clock 40 ms back is a new clock, not a
+        // late packet.
+        let again = h.media(60, TimelineSource::LOCAL, 90_000);
+        assert_eq!(again, out[2] + 160);
+        assert!(h.sent.last().unwrap().1);
+        h.assert_never_backwards();
     }
 
     #[test]
