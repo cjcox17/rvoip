@@ -111,8 +111,9 @@ pub enum IceEvent {
     /// The peer stopped answering consent checks (RFC 7675): stop sending.
     ///
     /// A lite agent sends no checks; for it this means the peer has sent no
-    /// authenticated check for [`AgentConfig::consent_expiry`] since a pair
-    /// was selected. Reported once per silence.
+    /// authenticated check (nor a Binding Indication from the selected
+    /// pair's remote address) for [`AgentConfig::consent_expiry`] since a
+    /// pair was selected. Reported once per silence.
     ConsentExpired,
     /// Consent came back after [`IceEvent::ConsentExpired`]: an
     /// authenticated check (lite) or consent response (full) arrived.
@@ -428,7 +429,14 @@ impl IceAgent {
                 self.process_response(now, source, &message);
             }
             MessageClass::Indication => {
-                // Keepalive received; nothing to answer (RFC 8445 §11).
+                // Keepalive received; nothing to answer (RFC 8445 §11). A
+                // lite agent counts one from the selected pair's peer as
+                // consent: peers that are not browsers keep the pair alive
+                // with Binding Indications instead of checks. Indications
+                // carry no integrity, so only the selected source counts.
+                if self.config.lite && self.selected == Some((local, source)) {
+                    self.note_lite_consent(now);
+                }
             }
         }
         Ok(())

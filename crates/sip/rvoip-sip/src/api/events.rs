@@ -954,6 +954,14 @@ pub enum Event {
     /// (RFC 7675). Media keeps flowing to the old address; the application
     /// decides how long to wait before ending the call. Published once per
     /// silence; sessions without ICE never publish it.
+    ///
+    /// Consent evidence for an ICE-lite endpoint is the peer's
+    /// authenticated Binding Requests and Binding Indications from the
+    /// selected pair's address. WebRTC peers send checks every few
+    /// seconds; an ICE peer that keeps the pair alive some other way (media
+    /// only, or nothing) is reported lost after the timeout although its
+    /// media may still flow, so a "hang up dead legs" policy belongs on
+    /// legs whose peers are known to send consent checks (WebRTC).
     MediaPathLost {
         /// Session whose media path went quiet.
         call_id: CallId,

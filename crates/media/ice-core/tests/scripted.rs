@@ -810,3 +810,41 @@ fn a_lite_agent_without_a_selection_never_expires_consent() {
     agent.handle_timeout(now + Duration::from_secs(120));
     assert!(drain(&mut agent).is_empty());
 }
+
+/// Peers that keep the selected pair alive with Binding Indications (RFC
+/// 8445 §11) rather than checks keep consent on a lite agent; an indication
+/// from any other address does not.
+#[test]
+fn a_lite_agent_counts_indications_from_the_selected_pair_as_consent() {
+    use rvoip_ice_core::stun::{StunMessage, TransactionId};
+    let local: SocketAddr = "198.51.100.5:5004".parse().unwrap();
+    let source: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+    let stranger: SocketAddr = "203.0.113.66:40000".parse().unwrap();
+    let ours = creds("srvr", "server-password-of-22char");
+    let mut agent = IceAgent::new(AgentConfig::lite(ours.clone()));
+    agent.add_local_candidate(Candidate::host(local, 1, 65_535));
+    let start = Instant::now();
+    lite_check(&mut agent, start, local, source, &ours, true);
+    drain(&mut agent);
+    let indication =
+        StunMessage::binding(MessageClass::Indication, TransactionId::random()).encode(None, true);
+
+    // Indications from the selected peer every 15 s: consent holds.
+    for step in 1..=4 {
+        let at = start + Duration::from_secs(15 * step);
+        agent.handle_timeout(at);
+        agent.handle_packet(at, local, source, &indication).unwrap();
+    }
+    agent.handle_timeout(start + Duration::from_secs(80));
+    assert!(drain(&mut agent).is_empty(), "indications keep consent");
+
+    // Indications from another address do not.
+    for step in 1..=4 {
+        let at = start + Duration::from_secs(60 + 10 * step);
+        agent
+            .handle_packet(at, local, stranger, &indication)
+            .unwrap();
+    }
+    agent.handle_timeout(start + Duration::from_secs(91));
+    assert!(drain(&mut agent).contains(&IceEvent::ConsentExpired));
+}

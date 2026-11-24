@@ -2098,6 +2098,21 @@ impl MediaSessionController {
         Ok(())
     }
 
+    /// Watch ClientHellos that reach a dialog's established DTLS association
+    /// (the peer starting a new handshake on the same transport). `None`
+    /// without a UDP transport.
+    #[cfg(feature = "dtls-srtp")]
+    pub async fn dtls_client_hello_watch(
+        &self,
+        dialog_id: &DialogId,
+    ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        let transport = self.ice_transport(dialog_id).await?;
+        let udp = transport
+            .as_any()
+            .downcast_ref::<rtp_core::transport::UdpRtpTransport>()?;
+        Some(udp.subscribe_dtls_client_hello())
+    }
+
     /// Run a real DTLS-SRTP handshake (RFC 5764) for a dialog's RTP session
     /// and install the resulting keys the same way [`Self::install_srtp_contexts`]
     /// installs SDES ones — this is the DTLS-SRTP equivalent of that call,
@@ -2144,6 +2159,17 @@ impl MediaSessionController {
                 timeout,
             )
             .await;
+        if result.is_ok() {
+            // A ClientHello from now on is a new handshake by the peer.
+            if let Some(transport) = self.ice_transport(dialog_id).await {
+                if let Some(udp) = transport
+                    .as_any()
+                    .downcast_ref::<rtp_core::transport::UdpRtpTransport>()
+                {
+                    udp.mark_dtls_established();
+                }
+            }
+        }
         // Only the dialog's current entry is updated: a stopped dialog's
         // side state is gone and must not be recreated.
         if let Some(mut entry) = self.dtls_status.get_mut(dialog_id) {

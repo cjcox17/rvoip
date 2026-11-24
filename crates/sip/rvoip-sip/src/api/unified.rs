@@ -2688,7 +2688,10 @@ pub struct Config {
     /// is published (RFC 7675 consent). For an ICE-lite endpoint this is
     /// the time without an authenticated connectivity check from the peer
     /// (browsers send one every few seconds); for a full agent, without an
-    /// answer to its own consent checks. Default 30 seconds. Media keeps
+    /// answer to its own consent checks (a lite endpoint also counts Binding
+    /// Indications from the selected pair; see
+    /// [`Event::MediaPathLost`](crate::api::events::Event::MediaPathLost)
+    /// for which legs this suits). Default 30 seconds. Media keeps
     /// flowing; acting on the event (a grace period, then hanging up) is
     /// the application's media inactivity policy. Sessions without ICE are
     /// unaffected.
@@ -12202,7 +12205,7 @@ impl UnifiedCoordinator {
     /// kept when the peer keeps its certificate (RFC 8842 §5).
     ///
     /// For endpoints that change networks while a call is up (a full-ICE
-    /// client). Fails with [`SessionError::InvalidState`] when the call has
+    /// client). Fails with [`SessionError::InvalidTransition`] when the call has
     /// no ICE runtime. Completion follows the usual re-INVITE events.
     ///
     /// # Examples

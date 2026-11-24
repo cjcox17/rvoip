@@ -102,6 +102,17 @@ fn rtp_diagnostics_enabled() -> bool {
     RTP_DIAGNOSTICS_ENABLED.load(Ordering::Relaxed)
 }
 
+/// An epoch-0 DTLS handshake record carrying a ClientHello (RFC 6347
+/// §4.1: content type 22, epoch at bytes 3-4, handshake type at byte 13).
+#[cfg(feature = "dtls-webrtc")]
+fn is_dtls_client_hello(datagram: &[u8]) -> bool {
+    datagram.len() > 13
+        && datagram[0] == 22
+        && datagram[3] == 0
+        && datagram[4] == 0
+        && datagram[13] == 1
+}
+
 fn classify_rtp_mux_packet(buffer: &[u8]) -> RtpMuxPacketClass {
     if buffer.len() < 2 {
         return RtpMuxPacketClass::TooSmall;
@@ -521,6 +532,19 @@ pub struct UdpRtpTransport {
     #[cfg(feature = "dtls-webrtc")]
     dtls_tx: Arc<parking_lot::Mutex<Option<mpsc::Sender<Bytes>>>>,
 
+    /// Set once a handshake on this transport completed
+    /// ([`Self::mark_dtls_established`]); cleared when a new one starts.
+    #[cfg(feature = "dtls-webrtc")]
+    dtls_established: Arc<AtomicBool>,
+
+    /// Counts ClientHellos that arrived after the association was
+    /// established: the peer started a new handshake on the same transport
+    /// (RFC 8842 §5 lets a peer do that after an address change). The
+    /// datagram is not handed to the finished handshake; the owner of the
+    /// association decides whether to answer it with a new handshake.
+    #[cfg(feature = "dtls-webrtc")]
+    dtls_client_hello: Arc<tokio::sync::watch::Sender<u64>>,
+
     #[cfg(feature = "memory-diagnostics")]
     _memory_guard: rvoip_infra_common::memory_diagnostics::ObjectGuard,
     #[cfg(feature = "memory-diagnostics")]
@@ -703,6 +727,10 @@ impl UdpRtpTransport {
             dtmf_seen: Arc::new(DashMap::new()),
             #[cfg(feature = "dtls-webrtc")]
             dtls_tx: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "dtls-webrtc")]
+            dtls_established: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "dtls-webrtc")]
+            dtls_client_hello: Arc::new(tokio::sync::watch::channel(0).0),
             #[cfg(feature = "memory-diagnostics")]
             _memory_guard: rvoip_infra_common::memory_diagnostics::ObjectGuard::new(
                 "rtp_core.udp_transport",
@@ -753,6 +781,10 @@ impl UdpRtpTransport {
         let latched_rtp_ssrc = self.latched_rtp_ssrc.clone();
         #[cfg(feature = "dtls-webrtc")]
         let dtls_tx = self.dtls_tx.clone();
+        #[cfg(feature = "dtls-webrtc")]
+        let dtls_established = self.dtls_established.clone();
+        #[cfg(feature = "dtls-webrtc")]
+        let dtls_client_hello = self.dtls_client_hello.clone();
         let srtp_diagnostics = srtp_diagnostics_enabled();
         let rtp_diagnostics = rtp_diagnostics_enabled();
         let local_rtp_addr = rtp_socket.local_addr().ok();
@@ -801,6 +833,20 @@ impl UdpRtpTransport {
                                     source: addr,
                                     payload: Bytes::copy_from_slice(&buffer[..size]),
                                 });
+                                continue;
+                            }
+
+                            #[cfg(feature = "dtls-webrtc")]
+                            if packet_class == RtpMuxPacketClass::Dtls
+                                && dtls_established.load(Ordering::Acquire)
+                                && is_dtls_client_hello(&buffer[..size])
+                            {
+                                // A new handshake on an established
+                                // association: the finished one must not
+                                // see it. Its owner is told instead; the
+                                // peer retransmits the ClientHello.
+                                ReceiveCounters::bump(&counters.dtls_dropped);
+                                dtls_client_hello.send_modify(|count| *count += 1);
                                 continue;
                             }
 
@@ -1479,6 +1525,7 @@ impl UdpRtpTransport {
 
         let (tx, rx) = mpsc::channel(64);
         *self.dtls_tx.lock() = Some(tx);
+        self.dtls_established.store(false, Ordering::Release);
         let _ = self.dtls_before_handshake.compare_exchange(
             u64::MAX,
             self.receive_counters.dtls_dropped.load(Ordering::Relaxed),
@@ -1493,6 +1540,21 @@ impl UdpRtpTransport {
                 rx,
             ),
         ))
+    }
+
+    /// Record that the handshake started by [`Self::dtls_conn_adapter`]
+    /// completed. From now on a ClientHello is a new handshake by the peer
+    /// and is reported through [`Self::subscribe_dtls_client_hello`].
+    #[cfg(feature = "dtls-webrtc")]
+    pub fn mark_dtls_established(&self) {
+        self.dtls_established.store(true, Ordering::Release);
+    }
+
+    /// Watch the count of ClientHellos received on an established
+    /// association. The receiver errors once the transport is gone.
+    #[cfg(feature = "dtls-webrtc")]
+    pub fn subscribe_dtls_client_hello(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.dtls_client_hello.subscribe()
     }
 
     /// Get the remote RTCP address

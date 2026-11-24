@@ -2517,18 +2517,24 @@ impl MediaAdapter {
         }
     }
 
-    /// Whether the session's committed DTLS handshake failed: such an
-    /// association is not continued by a re-offer.
+    /// Whether the session's committed DTLS association may be continued by
+    /// a re-offer.
     #[cfg(feature = "dtls-srtp")]
-    async fn established_dtls_failed(&self, session: &SessionState) -> bool {
+    async fn established_dtls_usable(&self, session: &SessionState) -> bool {
+        use rvoip_media_core::relay::DtlsState;
         let Some(dialog_id) = session.media_session_id.as_ref() else {
             return false;
         };
+        // Connected, or still handshaking: a committed handshake in flight
+        // must not be replaced by a second one on the same socket. No status
+        // (nothing ran) or Failed never continues.
         self.controller
             .media_diagnostics(dialog_id)
             .await
             .and_then(|diagnostics| diagnostics.dtls)
-            .is_some_and(|status| status.state == rvoip_media_core::relay::DtlsState::Failed)
+            .is_some_and(|status| {
+                matches!(status.state, DtlsState::Connected | DtlsState::Handshaking)
+            })
     }
 
     /// Configure how inbound SDES inline keys handle trailing Base64 padding.
@@ -2894,7 +2900,7 @@ impl MediaAdapter {
                         established.identity.fingerprint_sha256 == offered_identity
                             && established.continued_by_answer(&answer)
                     });
-                if established.is_some() && !self.established_dtls_failed(session).await {
+                if established.is_some() && self.established_dtls_usable(session).await {
                     self.pending_dtls_identities.remove(&negotiation_key);
                     dtls_continued = true;
                     None
@@ -3232,6 +3238,12 @@ impl MediaAdapter {
         // detected mismatch means a middlebox rewrote the SDP after the
         // peer built it; ICE stands down for this call rather than fighting
         // the box that owns the path.
+        // Whether the offer carries ICE attributes at all: only an offer
+        // without them stops a running agent. A mismatched offer is answered
+        // without ICE but leaves a running agent (and its nominated pair)
+        // alone, as it always did.
+        let offer_has_ice =
+            crate::adapters::ice_adapter::extract_remote_ice(&parsed_offer).is_some();
         let remote_ice = if self.ice_policy != crate::adapters::ice_adapter::SipIcePolicy::Disabled
         {
             match crate::adapters::ice_adapter::extract_remote_ice(&parsed_offer) {
@@ -3306,7 +3318,7 @@ impl MediaAdapter {
                         .map(|entry| entry.value().clone())
                         .filter(|established| established.continued_by_offer(&offer));
                     let established = match established {
-                        Some(established) if !self.established_dtls_failed(session).await => {
+                        Some(established) if self.established_dtls_usable(session).await => {
                             Some(established)
                         }
                         _ => None,
@@ -3623,9 +3635,10 @@ impl MediaAdapter {
                 }
             }
         }
-        // A re-offer without (usable) ICE on a running agent: stop it at the
-        // commit, which releases the ICE hold on the media destination.
-        if remote_ice.is_none() && self.ice.is_active(&session_id) {
+        // A re-offer without any ICE attributes on a running agent: the peer
+        // stopped doing ICE. Stop the agent at the commit, which releases the
+        // ICE hold on the media destination.
+        if !offer_has_ice && self.ice.is_active(&session_id) {
             staged_ice = Some(StagedIce::Stop);
         }
 
@@ -3801,6 +3814,93 @@ impl MediaAdapter {
                 adapter
                     .publish_media_security_failure(&handle, &dialog_id)
                     .await;
+            }
+        });
+    }
+
+    /// As the DTLS server of an association that is kept across re-offers,
+    /// answer a peer that starts a new handshake anyway (some endpoints do
+    /// after an address change): a ClientHello on the established
+    /// association runs a new server handshake with the same certificate,
+    /// checked against the peer's signalled fingerprint. Ends with the
+    /// association (a new one arms its own watch), the media session or the
+    /// transport.
+    #[cfg(feature = "dtls-srtp")]
+    async fn spawn_dtls_rehandshake_watch(
+        &self,
+        handle: SessionRegistryHandle,
+        dialog_id: DialogId,
+        key: MediaNegotiationKey,
+        remote_addr: SocketAddr,
+        local_fingerprint: [u8; 32],
+    ) {
+        let Some(mut client_hellos) = self.controller.dtls_client_hello_watch(&dialog_id).await
+        else {
+            return;
+        };
+        client_hellos.borrow_and_update();
+        let adapter = self.clone();
+        spawn_memory_tracked("sip.media_adapter.dtls_rehandshake_watch", async move {
+            let current = |adapter: &MediaAdapter| {
+                adapter
+                    .established_dtls
+                    .get(&key)
+                    .map(|entry| entry.value().clone())
+                    .filter(|established| {
+                        established.identity.fingerprint_sha256 == local_fingerprint
+                            && established.local_role == SetupRole::Passive
+                    })
+                    .filter(|_| {
+                        adapter
+                            .media_resources
+                            .get(handle.session_id())
+                            .is_some_and(|binding| binding.matches(&handle, &dialog_id))
+                    })
+            };
+            loop {
+                tokio::select! {
+                    changed = client_hellos.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    () = tokio::time::sleep(Duration::from_secs(30)) => {
+                        if current(&adapter).is_none() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                let Some(established) = current(&adapter) else {
+                    return;
+                };
+                tracing::info!(
+                    session = %handle.session_id().0,
+                    "peer started a new DTLS handshake on a kept association; answering it"
+                );
+                let plan = StagedDtlsHandshake {
+                    role: SetupRole::Passive,
+                    expected_remote_fingerprint_sha256: established.remote_fingerprint_sha256,
+                };
+                if let Err(error) = adapter
+                    .run_committed_dtls_handshake(
+                        &handle,
+                        &dialog_id,
+                        remote_addr,
+                        established.identity,
+                        plan,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        session = %handle.session_id().0,
+                        "DTLS-SRTP re-handshake failed: {error}"
+                    );
+                    adapter
+                        .publish_media_security_failure(&handle, &dialog_id)
+                        .await;
+                }
+                client_hellos.borrow_and_update();
             }
         });
     }
@@ -4219,6 +4319,16 @@ impl MediaAdapter {
                     remote_fingerprint_sha256: plan.expected_remote_fingerprint_sha256,
                 },
             );
+            if plan.role == SetupRole::Passive {
+                self.spawn_dtls_rehandshake_watch(
+                    handle.clone(),
+                    dialog_id.clone(),
+                    prepared.negotiation_key.clone(),
+                    prepared.remote_addr,
+                    identity.fingerprint_sha256,
+                )
+                .await;
+            }
             self.spawn_committed_dtls_handshake(
                 handle,
                 dialog_id,
@@ -5983,8 +6093,6 @@ impl MediaAdapter {
         }
 
         let session_id = handle.session_id();
-        // The ICE pump must not outlive the media session it steers.
-        self.ice.stop(session_id);
         self.discard_pending_srtp_offer_exact(handle);
         self.discard_staged_media_negotiation_exact(handle);
         let retained_binding = self
@@ -12079,6 +12187,10 @@ a=fmtp:101 0-15\r\n";
         credentials: rvoip_ice_core::Credentials,
         peer_addr: SocketAddr,
         keys: rvoip_rtp_core::dtls_srtp::DtlsSrtpHandshakeResult,
+        /// The browser's media socket (connected to our RTP address) and
+        /// certificate, for a later handshake on the same association.
+        peer_socket: Arc<tokio::net::UdpSocket>,
+        identity: rvoip_rtp_core::dtls_srtp::DtlsIdentity,
     }
 
     #[cfg(feature = "dtls-srtp")]
@@ -12114,11 +12226,12 @@ a=fmtp:101 0-15\r\n";
 
         let our_addr = call.local_rtp_addr().await;
         peer.socket.connect(our_addr).await.unwrap();
+        let peer_socket = Arc::new(peer.socket);
         let keys = tokio::time::timeout(
             Duration::from_secs(8),
             rvoip_rtp_core::dtls_srtp::handshake_client(
-                Arc::new(peer.socket),
-                identity,
+                peer_socket.clone(),
+                identity.clone(),
                 rvoip_rtp_core::dtls_srtp::default_srtp_profiles(),
             ),
         )
@@ -12133,6 +12246,8 @@ a=fmtp:101 0-15\r\n";
             credentials,
             peer_addr,
             keys,
+            peer_socket,
+            identity,
         }
     }
 
@@ -12165,7 +12280,11 @@ a=fmtp:101 0-15\r\n";
                 .expect("protect")
                 .serialize()
                 .expect("serialize");
-            socket.send_to(&protected, to).await.unwrap();
+            if socket.peer_addr().ok() == Some(to) {
+                socket.send(&protected).await.unwrap();
+            } else {
+                socket.send_to(&protected, to).await.unwrap();
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -12450,6 +12569,142 @@ a=fmtp:101 0-15\r\n";
             Some(rvoip_media_core::relay::DtlsState::Connected),
             "no second handshake"
         );
+        call.hang_up().await;
+    }
+
+    /// A peer that starts a new DTLS handshake on an association both sides
+    /// kept (some endpoints re-handshake after an address change even with
+    /// an unchanged certificate) gets a server handshake on the same
+    /// certificate, and the new keys are installed.
+    #[cfg(feature = "dtls-srtp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_client_hello_on_a_kept_association_is_answered() {
+        let mut browser = browser_call("dtls-rehandshake", 32_200).await;
+        let our_addr = browser.call.local_rtp_addr().await;
+        let hold = browser_offer(
+            browser.peer_addr,
+            Some(&browser.credentials),
+            &browser.identity_fingerprint,
+            2,
+            "sendrecv",
+        );
+        let answer = browser.call.accept_offer(&hold).await;
+        assert_eq!(
+            sdp_attribute(&answer, "fingerprint"),
+            sdp_attribute(&browser.answer, "fingerprint"),
+            "the association is kept"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let keys = tokio::time::timeout(
+            Duration::from_secs(8),
+            rvoip_rtp_core::dtls_srtp::handshake_client(
+                browser.peer_socket.clone(),
+                browser.identity.clone(),
+                rvoip_rtp_core::dtls_srtp::default_srtp_profiles(),
+            ),
+        )
+        .await
+        .expect("a new ClientHello on a kept association must be answered")
+        .expect("the new handshake completes");
+        assert_eq!(
+            Some(format!(
+                "sha-256 {}",
+                fingerprint_hex(&keys.remote_fingerprint_sha256)
+            )),
+            sdp_attribute(&browser.answer, "fingerprint"),
+            "the server answers with the same certificate"
+        );
+        browser.call.await_dtls_connected().await;
+        let before = browser.call.receive().await;
+        send_srtp(&browser.peer_socket, our_addr, &keys, 500, 20).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while browser.call.receive().await.rtp_delivered < before.rtp_delivered + 10 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "SRTP on the new handshake's keys must be delivered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        browser.call.hang_up().await;
+    }
+
+    /// A browser re-offer whose default is the RFC 8840 placeholder
+    /// (`c=IN IP4 0.0.0.0`, port 9) with the same credentials is not an
+    /// ICE mismatch: ICE keeps running and media stays on the nominated
+    /// pair.
+    #[cfg(feature = "dtls-srtp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_placeholder_default_in_a_reoffer_keeps_ice_running() {
+        let mut browser = browser_call("ice-placeholder-reoffer", 32_300).await;
+        let reoffer = browser_offer(
+            browser.peer_addr,
+            Some(&browser.credentials),
+            &browser.identity_fingerprint,
+            2,
+            "sendrecv",
+        )
+        .replace("c=IN IP4 127.0.0.1", "c=IN IP4 0.0.0.0")
+        .replace(
+            &format!("m=audio {} ", browser.peer_addr.port()),
+            "m=audio 9 ",
+        );
+        assert!(reoffer.contains("m=audio 9 "), "{reoffer}");
+        let answer = browser.call.accept_offer(&reoffer).await;
+        assert!(answer.contains("a=ice-ufrag"), "{answer}");
+        assert!(browser.call.adapter.ice.is_active(&browser.call.session_id));
+        assert_eq!(browser.call.live_remote().await, Some(browser.peer_addr));
+        browser.call.hang_up().await;
+    }
+
+    /// A re-offer that really is ice-mismatched (its default is neither a
+    /// candidate nor the placeholder) is answered without ICE, as before,
+    /// but does not stop the running agent or move media off its pair.
+    #[cfg(feature = "dtls-srtp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mismatched_reoffer_leaves_the_running_agent_alone() {
+        let mut browser = browser_call("ice-mismatch-reoffer", 32_400).await;
+        let reoffer = browser_offer(
+            browser.peer_addr,
+            Some(&browser.credentials),
+            &browser.identity_fingerprint,
+            2,
+            "sendrecv",
+        )
+        .replace("c=IN IP4 127.0.0.1", "c=IN IP4 192.0.2.10");
+        let answer = browser.call.accept_offer(&reoffer).await;
+        assert!(!answer.contains("a=ice-ufrag"), "{answer}");
+        assert!(browser.call.adapter.ice.is_active(&browser.call.session_id));
+        assert_eq!(browser.call.live_remote().await, Some(browser.peer_addr));
+        browser.call.hang_up().await;
+    }
+
+    /// The same placeholder in an answer on the state-machine (lane-owned)
+    /// answer path keeps ICE and the nominated pair.
+    #[cfg(feature = "dtls-srtp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_placeholder_default_in_an_answer_keeps_ice_running() {
+        use crate::state_table::types::Role;
+        let mut call = non_mux_call_with(
+            "ice-placeholder-answer",
+            Role::UAC,
+            32_500,
+            None,
+            false,
+            |a| ice_lite_dtls_offerer(a),
+        )
+        .await;
+        let offer = call.offer().await;
+        let mut peer = IceTestPeer::for_offer(&offer).await;
+        peer.nominate().await;
+        call.await_live_remote(peer.addr).await;
+        let identity = rvoip_rtp_core::dtls_srtp::generate_identity().expect("identity");
+        let answer = ice_dtls_answer(peer.addr, &peer.credentials(), &identity.fingerprint_sha256)
+            .replace("c=IN IP4 127.0.0.1", "c=IN IP4 0.0.0.0")
+            .replace(&format!("m=audio {} ", peer.addr.port()), "m=audio 9 ");
+        assert!(answer.contains("m=audio 9 "), "{answer}");
+        call.accept_answer(&answer).await;
+        assert!(call.adapter.ice.is_active(&call.session_id));
+        assert_eq!(call.live_remote().await, Some(peer.addr));
         call.hang_up().await;
     }
 

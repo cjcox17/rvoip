@@ -613,7 +613,11 @@ pub(crate) fn extract_remote_ice(sdp: &SdpSession) -> Option<RemoteIce> {
     };
     // RFC 8839 §4.3: a default destination missing from the candidate set
     // means something between the peers rewrote the SDP. Detect, do not run.
+    // RFC 8840 §4.2: `c=IN IP4 0.0.0.0` / `IN IP6 ::` with port 9 is the
+    // placeholder an ICE agent writes when it has no default candidate to
+    // name (browsers do in re-offers). It is not a rewrite.
     let mismatch = match default_addr {
+        Some(default) if default.ip().is_unspecified() && default.port() == 9 => false,
         Some(default) if !candidates.is_empty() => {
             !candidates.iter().any(|candidate| candidate.addr == default)
         }
@@ -1061,6 +1065,31 @@ mod tests {
         ));
         let remote = extract_remote_ice(&sdp).expect("ice present");
         assert!(remote.mismatch);
+    }
+
+    #[test]
+    fn the_rfc_8840_placeholder_default_is_not_a_mismatch() {
+        for (connection, port) in [("IN IP4 0.0.0.0", 9), ("IN IP6 ::", 9)] {
+            let sdp = parse(&format!(
+                "v=0\r\no=- 1 2 IN IP4 198.51.100.7\r\ns=-\r\nc={connection}\r\nt=0 0\r\n\
+                 m=audio {port} UDP/TLS/RTP/SAVP 0\r\n\
+                 a=ice-ufrag:8hhY\r\na=ice-pwd:asd88fgpdd777uzjYhagZg1x\r\n\
+                 a=candidate:1 1 UDP 2130706431 198.51.100.7 5004 typ host\r\n"
+            ));
+            let remote = extract_remote_ice(&sdp).expect("ice present");
+            assert!(
+                !remote.mismatch,
+                "{connection} port {port} is the placeholder"
+            );
+        }
+        // Any other port on the unspecified address is still a mismatch.
+        let sdp = parse(&format!(
+            "v=0\r\no=- 1 2 IN IP4 198.51.100.7\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\n\
+             m=audio 6000 RTP/AVP 0\r\n\
+             a=ice-ufrag:8hhY\r\na=ice-pwd:asd88fgpdd777uzjYhagZg1x\r\n\
+             a=candidate:1 1 UDP 2130706431 198.51.100.7 5004 typ host\r\n"
+        ));
+        assert!(extract_remote_ice(&sdp).unwrap().mismatch);
     }
 
     #[test]
