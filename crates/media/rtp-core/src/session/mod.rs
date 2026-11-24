@@ -5,9 +5,12 @@
 
 mod scheduling;
 mod stream;
+mod timeline;
 
 pub use scheduling::{RtpScheduler, RtpSchedulerStats};
 pub use stream::{RtpStream, RtpStreamStats};
+pub use timeline::TimelineSource;
+use timeline::{OutgoingTimeline, PacketClass};
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -533,6 +536,8 @@ struct RtpPacketSender {
     /// RTP timestamp and wall time of the last media packet actually sent,
     /// the anchor a sender report extrapolates from (RFC 3550 §6.4.1).
     send_clock: parking_lot::Mutex<Option<SendClockAnchor>>,
+    /// The one timeline every producer on this SSRC is rebased onto.
+    timeline: parking_lot::Mutex<OutgoingTimeline>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -580,7 +585,16 @@ impl RtpPacketSender {
             media_payload_type: AtomicU8::new(media_payload_type),
             clock_rate,
             send_clock: parking_lot::Mutex::new(None),
+            timeline: parking_lot::Mutex::new(OutgoingTimeline::default()),
         }
+    }
+
+    /// The timestamp a new producer starting now would be sent with; see
+    /// [`RtpSendHandle::next_timestamp`].
+    fn next_timestamp(&self) -> Option<RtpTimestamp> {
+        self.timeline
+            .lock()
+            .next_timestamp(self.clock_rate.load(Ordering::Relaxed), Instant::now())
     }
 
     /// The RTP timestamp that corresponds to wall time `at` on this session's
@@ -596,6 +610,27 @@ impl RtpPacketSender {
 
     async fn send_payload(
         &self,
+        timestamp: RtpTimestamp,
+        payload: Bytes,
+        marker: bool,
+        payload_type: u8,
+    ) -> Result<()> {
+        self.send_payload_from(
+            TimelineSource::LOCAL,
+            timestamp,
+            payload,
+            marker,
+            payload_type,
+        )
+        .await
+    }
+
+    /// Send one payload stamped by `source`. The timestamp is rebased onto
+    /// the stream's one timeline (see [`TimelineSource`]); the marker is
+    /// also set where that starts a new talkspurt.
+    async fn send_payload_from(
+        &self,
+        source: TimelineSource,
         timestamp: RtpTimestamp,
         payload: Bytes,
         marker: bool,
@@ -630,9 +665,25 @@ impl RtpPacketSender {
         }
         .ok_or_else(|| Error::SessionError("No destination address for RTP packet".to_string()))?;
 
+        // Map under the wire-order lock, so the timeline sees packets in the
+        // order they are sent.
+        let is_media = payload_type == self.media_payload_type.load(Ordering::Relaxed)
+            || payload_type == COMFORT_NOISE_PAYLOAD_TYPE;
+        let mapped = self.timeline.lock().map(
+            source,
+            timestamp,
+            if is_media {
+                PacketClass::Media
+            } else {
+                PacketClass::Event
+            },
+            self.clock_rate.load(Ordering::Relaxed),
+            Instant::now(),
+        );
+        let timestamp = mapped.timestamp;
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let mut header = RtpHeader::new(payload_type, sequence, timestamp, self.ssrc);
-        header.marker = marker;
+        header.marker = marker || mapped.marker;
         let packet = RtpPacket::new(header, payload);
 
         debug!(
@@ -650,9 +701,7 @@ impl RtpPacketSender {
 
         match send_result {
             Ok(()) => {
-                if payload_type == self.media_payload_type.load(Ordering::Relaxed)
-                    || payload_type == COMFORT_NOISE_PAYLOAD_TYPE
-                {
+                if is_media {
                     *self.send_clock.lock() = Some(SendClockAnchor {
                         rtp_timestamp: timestamp,
                         sent_at: Instant::now(),
@@ -862,6 +911,39 @@ impl RtpSendHandle {
         self.packet_sender
             .send_payload(timestamp, payload, marker, payload_type)
             .await
+    }
+
+    /// Send an RTP packet stamped by `source` rather than by the session's
+    /// own producer.
+    ///
+    /// A producer that relays another clock onto this session (a bridge
+    /// forwarding a peer's packets) sends through this with its own
+    /// [`TimelineSource`]. Its timestamps are rebased onto the session's one
+    /// outgoing timeline, keeping their relative timing, so a switch between
+    /// producers never moves the stream backwards. See
+    /// [`TimelineSource`] for the rules.
+    pub async fn send_packet_from(
+        &self,
+        source: TimelineSource,
+        timestamp: RtpTimestamp,
+        payload: Bytes,
+        marker: bool,
+        payload_type: u8,
+    ) -> Result<()> {
+        self.packet_sender
+            .send_payload_from(source, timestamp, payload, marker, payload_type)
+            .await
+    }
+
+    /// The RTP timestamp a producer starting now would be sent with: just
+    /// after the last packet this session sent, advanced by the wall time
+    /// since. `None` until the session has sent a packet.
+    ///
+    /// A producer that stamps its first frame from this value, and the rest
+    /// from its own sample count, is sent with exactly the timestamps it
+    /// stamped, on the same timeline as anything else the session sends.
+    pub fn next_timestamp(&self) -> Option<RtpTimestamp> {
+        self.packet_sender.next_timestamp()
     }
 
     /// Get the session's SSRC (immutable post-construction).
@@ -1809,6 +1891,27 @@ impl RtpSession {
         self.packet_sender
             .send_payload(timestamp, payload, marker, payload_type)
             .await
+    }
+
+    /// Send an RTP packet stamped by `source`; see
+    /// [`RtpSendHandle::send_packet_from`].
+    pub async fn send_packet_from(
+        &self,
+        source: TimelineSource,
+        timestamp: RtpTimestamp,
+        payload: Bytes,
+        marker: bool,
+        payload_type: u8,
+    ) -> Result<()> {
+        self.packet_sender
+            .send_payload_from(source, timestamp, payload, marker, payload_type)
+            .await
+    }
+
+    /// The RTP timestamp a producer starting now would be sent with; see
+    /// [`RtpSendHandle::next_timestamp`].
+    pub fn next_timestamp(&self) -> Option<RtpTimestamp> {
+        self.packet_sender.next_timestamp()
     }
 
     /// Get a lock-free send handle for this session.
