@@ -1083,12 +1083,12 @@ mod tests {
             );
         }
         // Any other port on the unspecified address is still a mismatch.
-        let sdp = parse(&format!(
+        let sdp = parse(
             "v=0\r\no=- 1 2 IN IP4 198.51.100.7\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\n\
              m=audio 6000 RTP/AVP 0\r\n\
              a=ice-ufrag:8hhY\r\na=ice-pwd:asd88fgpdd777uzjYhagZg1x\r\n\
-             a=candidate:1 1 UDP 2130706431 198.51.100.7 5004 typ host\r\n"
-        ));
+             a=candidate:1 1 UDP 2130706431 198.51.100.7 5004 typ host\r\n",
+        );
         assert!(extract_remote_ice(&sdp).unwrap().mismatch);
     }
 

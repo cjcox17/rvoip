@@ -12690,7 +12690,7 @@ a=fmtp:101 0-15\r\n";
             32_500,
             None,
             false,
-            |a| ice_lite_dtls_offerer(a),
+            ice_lite_dtls_offerer,
         )
         .await;
         let offer = call.offer().await;
