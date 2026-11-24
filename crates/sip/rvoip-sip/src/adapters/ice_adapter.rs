@@ -281,6 +281,9 @@ async fn run_ice_pump(
                         "ICE consent expired: the peer stopped answering; media may be black-holed"
                     );
                 }
+                IceEvent::ConsentResumed { .. } => {
+                    tracing::info!(session = %session_label, "ICE consent resumed");
+                }
                 IceEvent::StateChanged(state) => {
                     tracing::debug!(session = %session_label, ?state, "ICE state");
                     if state == rvoip_ice_core::IceState::Failed {
