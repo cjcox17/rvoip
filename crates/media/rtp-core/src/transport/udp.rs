@@ -1376,6 +1376,17 @@ impl UdpRtpTransport {
         let _writer = self.destination_writer.lock();
         self.ice_selected_rtp_addr.store(Some(Arc::new(addr)));
         self.retarget(addr);
+        self.retarget_muxed_rtcp(addr);
+    }
+
+    /// Multiplexed RTCP shares the RTP destination (RFC 5761): keep it on
+    /// the address media now goes to. RTCP on a separate socket keeps its
+    /// own (signalled) destination.
+    fn retarget_muxed_rtcp(&self, addr: SocketAddr) {
+        let separate = !self.rtcp_mux.load(Ordering::Acquire) && self.rtcp_socket.load().is_some();
+        if !separate {
+            self.remote_rtcp_addr.store(Some(Arc::new(addr)));
+        }
     }
 
     /// Forget the ICE-nominated address (the session's ICE agent stopped:
@@ -1388,6 +1399,7 @@ impl UdpRtpTransport {
         }
         if let Some(sdp) = self.sdp_rtp_addr.load().as_deref().copied() {
             self.retarget(sdp);
+            self.retarget_muxed_rtcp(sdp);
         }
     }
 
@@ -2405,6 +2417,63 @@ mod tests {
         transport.clear_ice_selected_rtp_addr();
         assert_eq!(transport.remote_rtp_addr().await, Some(sdp_default));
         assert_eq!(transport.dtls_datagrams_before_handshake(), None);
+    }
+
+    /// Multiplexed RTCP shares the RTP destination (RFC 5761), so it must
+    /// follow every ICE retarget: a nomination after the SDP commit (an
+    /// ICE restart after the peer changed networks) used to leave RTCP on
+    /// the old address.
+    #[tokio::test]
+    async fn muxed_rtcp_follows_an_ice_retarget() {
+        let config = RtpTransportConfig {
+            local_rtp_addr: "127.0.0.1:0".parse().unwrap(),
+            local_rtcp_addr: None,
+            symmetric_rtp: true,
+            rtcp_mux: true,
+            session_id: Some("ice-rtcp-mux".to_string()),
+            use_port_allocator: false,
+            buffer_config: Default::default(),
+        };
+        let transport = UdpRtpTransport::new(config).await.unwrap();
+        let sdp_default: SocketAddr = "198.51.100.5:50000".parse().unwrap();
+        let first: SocketAddr = "203.0.113.20:40000".parse().unwrap();
+        let moved: SocketAddr = "203.0.113.77:51000".parse().unwrap();
+
+        transport.set_remote_rtp_addr(sdp_default).await;
+        transport.store_remote_rtcp_addr(sdp_default);
+        transport.set_ice_selected_rtp_addr(first);
+        assert_eq!(transport.remote_rtcp_addr().await, Some(first));
+        transport.set_ice_selected_rtp_addr(moved);
+        assert_eq!(
+            transport.remote_rtcp_addr().await,
+            Some(moved),
+            "muxed RTCP must follow the new nomination"
+        );
+        transport.clear_ice_selected_rtp_addr();
+        assert_eq!(transport.remote_rtcp_addr().await, Some(sdp_default));
+    }
+
+    /// RTCP on its own socket (no mux) keeps its signalled destination:
+    /// ICE only steers the RTP port.
+    #[tokio::test]
+    async fn separate_rtcp_ignores_an_ice_retarget() {
+        let config = RtpTransportConfig {
+            local_rtp_addr: "127.0.0.1:0".parse().unwrap(),
+            local_rtcp_addr: Some("127.0.0.1:0".parse().unwrap()),
+            symmetric_rtp: true,
+            rtcp_mux: false,
+            session_id: Some("ice-rtcp-separate".to_string()),
+            use_port_allocator: false,
+            buffer_config: Default::default(),
+        };
+        let transport = UdpRtpTransport::new(config).await.unwrap();
+        let rtcp: SocketAddr = "198.51.100.5:50001".parse().unwrap();
+        transport
+            .set_remote_rtp_addr("198.51.100.5:50000".parse().unwrap())
+            .await;
+        transport.store_remote_rtcp_addr(rtcp);
+        transport.set_ice_selected_rtp_addr("203.0.113.20:40000".parse().unwrap());
+        assert_eq!(transport.remote_rtcp_addr().await, Some(rtcp));
     }
 
     #[tokio::test]
