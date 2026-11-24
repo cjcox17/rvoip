@@ -947,6 +947,35 @@ pub enum Event {
         dtls_datagrams_forwarded: u64,
     },
 
+    /// The peer stopped proving it is reachable on the call's ICE path:
+    /// an ICE-lite endpoint received no authenticated connectivity check
+    /// (a full one got no consent response) for
+    /// [`Config::ice_consent_timeout`](crate::api::unified::Config::ice_consent_timeout)
+    /// (RFC 7675). Media keeps flowing to the old address; the application
+    /// decides how long to wait before ending the call. Published once per
+    /// silence; sessions without ICE never publish it.
+    MediaPathLost {
+        /// Session whose media path went quiet.
+        call_id: CallId,
+    },
+
+    /// Consent came back after [`Event::MediaPathLost`]: the peer checks
+    /// (or answers) again on the call's ICE path.
+    MediaPathRestored {
+        /// Session whose media path recovered.
+        call_id: CallId,
+        /// How long the peer had been silent, in milliseconds.
+        silent_ms: u64,
+    },
+
+    /// An ICE restart (RFC 8445 §9) committed: the peer (or this side)
+    /// re-offered with new ICE credentials, typically after a network
+    /// change. Media moves to the pair the controlling side nominates next.
+    IceRestarted {
+        /// Session whose ICE agent restarted.
+        call_id: CallId,
+    },
+
     // ===== Registration Events =====
     /// Registration successful.
     ///
@@ -1301,6 +1330,12 @@ impl std::fmt::Debug for Event {
                 )
                 .field("dtls_datagrams_forwarded", dtls_datagrams_forwarded)
                 .finish(),
+            Self::MediaPathLost { .. } => formatter.debug_struct("MediaPathLost").finish(),
+            Self::MediaPathRestored { silent_ms, .. } => formatter
+                .debug_struct("MediaPathRestored")
+                .field("silent_ms", silent_ms)
+                .finish(),
+            Self::IceRestarted { .. } => formatter.debug_struct("IceRestarted").finish(),
             Self::RegistrationSuccess {
                 registrar,
                 expires,
@@ -1385,6 +1420,9 @@ impl Event {
             | Event::MediaQualityChanged { call_id, .. }
             | Event::MediaSecurityNegotiated { call_id, .. }
             | Event::MediaSecurityFailed { call_id, .. }
+            | Event::MediaPathLost { call_id }
+            | Event::MediaPathRestored { call_id, .. }
+            | Event::IceRestarted { call_id }
             | Event::NotifyReceived { call_id, .. }
             | Event::AuthenticationRequired { call_id, .. } => Some(call_id),
             Event::TransferTargetAnswered {
@@ -1480,6 +1518,9 @@ impl Event {
                 | Event::MediaQualityChanged { .. }
                 | Event::MediaSecurityNegotiated { .. }
                 | Event::MediaSecurityFailed { .. }
+                | Event::MediaPathLost { .. }
+                | Event::MediaPathRestored { .. }
+                | Event::IceRestarted { .. }
         )
     }
 

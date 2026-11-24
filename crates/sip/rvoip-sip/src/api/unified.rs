@@ -2683,6 +2683,17 @@ pub struct Config {
     /// layout): ICE v1 traverses one component.
     pub ice: crate::adapters::ice_adapter::SipIcePolicy,
 
+    /// How long an ICE session's peer may stay silent on the media path
+    /// before [`Event::MediaPathLost`](crate::api::events::Event::MediaPathLost)
+    /// is published (RFC 7675 consent). For an ICE-lite endpoint this is
+    /// the time without an authenticated connectivity check from the peer
+    /// (browsers send one every few seconds); for a full agent, without an
+    /// answer to its own consent checks. Default 30 seconds. Media keeps
+    /// flowing; acting on the event (a grace period, then hanging up) is
+    /// the application's media inactivity policy. Sessions without ICE are
+    /// unaffected.
+    pub ice_consent_timeout: Duration,
+
     /// Refuse to fall back to plaintext RTP when SRTP can't be
     /// negotiated.
     ///
@@ -3275,6 +3286,7 @@ impl std::fmt::Debug for Config {
             .field("srtp_keying", &self.srtp_keying)
             .field("dtls_setup_role", &self.dtls_setup_role)
             .field("ice", &self.ice)
+            .field("ice_consent_timeout", &self.ice_consent_timeout)
             .field("srtp_required", &self.srtp_required)
             .field("amr_dtx", &self.amr_dtx)
             .field("amr_auto_cmr", &self.amr_auto_cmr)
@@ -3410,6 +3422,7 @@ impl Config {
             // smoothing should say so.
             playout: None,
             ice: crate::adapters::ice_adapter::SipIcePolicy::Disabled,
+            ice_consent_timeout: crate::adapters::ice_adapter::DEFAULT_CONSENT_EXPIRY,
             bind_addr: SocketAddr::new(ip, port),
             sip_advertised_addr: None,
             state_table_path: None,
@@ -3544,6 +3557,7 @@ impl Config {
             // smoothing should say so.
             playout: None,
             ice: crate::adapters::ice_adapter::SipIcePolicy::Disabled,
+            ice_consent_timeout: crate::adapters::ice_adapter::DEFAULT_CONSENT_EXPIRY,
             bind_addr: SocketAddr::new(ip, port),
             sip_advertised_addr: None,
             state_table_path: None,
@@ -9929,6 +9943,7 @@ impl UnifiedCoordinator {
             config.rtcp_reduced_minimum_interval,
         );
         media_adapter_inner.set_ice_policy(config.ice);
+        media_adapter_inner.set_ice_consent_timeout(config.ice_consent_timeout);
         // Apply RFC 4568 SDES-SRTP policy from Config (Step 2B.1).
         media_adapter_inner.set_srtp_policy(
             config.offer_srtp,
@@ -12178,6 +12193,55 @@ impl UnifiedCoordinator {
             .process_event(session_id, EventType::ResumeCall)
             .await?;
         Ok(())
+    }
+
+    /// Restart ICE on a call (RFC 8445 §9), as the offerer: send a
+    /// re-INVITE whose offer carries new ICE credentials and the call's
+    /// current direction. When the answer commits, the agent restarts and
+    /// media moves to the next nominated pair; the DTLS association is
+    /// kept when the peer keeps its certificate (RFC 8842 §5).
+    ///
+    /// For endpoints that change networks while a call is up (a full-ICE
+    /// client). Fails with [`SessionError::InvalidState`] when the call has
+    /// no ICE runtime. Completion follows the usual re-INVITE events.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(coordinator: std::sync::Arc<rvoip_sip::UnifiedCoordinator>, call_id: rvoip_sip::SessionId) -> rvoip_sip::Result<()> {
+    /// coordinator.restart_ice(&call_id).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn restart_ice(self: &Arc<Self>, session_id: &SessionId) -> Result<()> {
+        if self.media_adapter.restart_ice_local(session_id).is_none() {
+            return Err(SessionError::InvalidTransition(
+                "ICE restart requires a call with an ICE runtime".to_string(),
+            ));
+        }
+        let direction = self
+            .helpers
+            .state_machine
+            .store
+            .get_session(session_id)
+            .await
+            .map(|session| session.local_media_direction)
+            .unwrap_or(crate::types::MediaDirection::SendRecv);
+        let sent = async {
+            let sdp = self
+                .media_adapter
+                .generate_local_sdp_offer(session_id, direction)
+                .await?;
+            crate::api::send::ReInviteBuilder::new(Arc::clone(self), session_id.clone())
+                .with_sdp(sdp)
+                .send()
+                .await
+        }
+        .await;
+        if sent.is_err() {
+            self.media_adapter.discard_ice_restart(session_id);
+        }
+        sent.map(|_| ())
     }
 
     pub(crate) async fn resume_exact(&self, handle: &SessionRegistryHandle) -> Result<()> {

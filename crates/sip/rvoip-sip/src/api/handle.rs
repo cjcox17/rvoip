@@ -695,6 +695,23 @@ impl SessionHandle {
         self.coordinator.hold_exact(&handle).await
     }
 
+    /// Restart ICE on this call with a re-INVITE carrying new ICE
+    /// credentials (RFC 8445 §9), e.g. after this endpoint changed
+    /// networks. See [`UnifiedCoordinator::restart_ice`](crate::UnifiedCoordinator::restart_ice).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(call: rvoip_sip::SessionHandle) -> rvoip_sip::Result<()> {
+    /// call.restart_ice().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn restart_ice(&self) -> Result<()> {
+        self.exact_lifecycle_handle()?;
+        self.coordinator.restart_ice(&self.call_id).await
+    }
+
     /// Resume a held call with a target-refresh re-INVITE.
     ///
     /// On success, applications observe [`Event::CallResumed`].

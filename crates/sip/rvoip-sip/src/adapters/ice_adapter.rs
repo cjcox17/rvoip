@@ -69,8 +69,35 @@ pub struct IceMaterial {
     pub candidates: Vec<Candidate>,
 }
 
+/// What the ICE pump tells the application about a session's media path.
+/// Carries no addresses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IcePathEvent {
+    /// The peer stopped sending (lite) or answering (full) consent checks.
+    Lost,
+    /// Consent came back after [`IcePathEvent::Lost`].
+    Restored {
+        /// How long the peer was silent.
+        silent: Duration,
+    },
+    /// An ICE restart committed: the agent runs on new credentials.
+    Restarted,
+}
+
+/// Receives a session's [`IcePathEvent`]s. Called from the pump task; it
+/// must not block.
+pub(crate) type IceObserver = Arc<dyn Fn(IcePathEvent) + Send + Sync>;
+
 enum IceCommand {
     SetRemote {
+        credentials: Credentials,
+        candidates: Vec<Candidate>,
+        remote_lite: bool,
+    },
+    /// RFC 8445 §9: restart the agent on new local credentials, then apply
+    /// the peer's new material.
+    Restart {
+        local: Credentials,
         credentials: Credentials,
         candidates: Vec<Candidate>,
         remote_lite: bool,
@@ -84,7 +111,32 @@ struct IceRuntime {
     /// The media transport the pump steers; stopping the runtime releases
     /// its hold on the nominated destination.
     transport: Arc<dyn RtpTransport>,
+    /// The peer's credentials as last applied. A later offer with other
+    /// credentials is an ICE restart (RFC 8839 §4.4.1.1.1).
+    remote: Option<Credentials>,
+    /// New local credentials this side offered to restart ICE and that the
+    /// answer has not committed yet.
+    pending_local: Option<Credentials>,
 }
+
+/// Per-endpoint ICE settings a runtime is created with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IceTuning {
+    /// RFC 7675 consent expiry (lite: the peer's checks; full: the peer's
+    /// answers to ours).
+    pub(crate) consent_expiry: Duration,
+}
+
+impl Default for IceTuning {
+    fn default() -> Self {
+        Self {
+            consent_expiry: DEFAULT_CONSENT_EXPIRY,
+        }
+    }
+}
+
+/// RFC 7675 §5.1's 30 seconds.
+pub const DEFAULT_CONSENT_EXPIRY: Duration = Duration::from_secs(30);
 
 /// One ICE runtime per media session, owned by the media adapter.
 #[derive(Default)]
@@ -106,6 +158,9 @@ impl IceRuntimes {
     /// SDP should carry. Returns `None` — with a warning — when the media
     /// transport is not reachable, in which case the SDP simply goes out
     /// without ICE and the call proceeds on the classic path.
+    ///
+    /// An offer from a session with a pending restart
+    /// ([`Self::restart_local`]) carries the new credentials.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn ensure_local(
         &self,
@@ -116,9 +171,16 @@ impl IceRuntimes {
         offerer: bool,
         host_addr: SocketAddr,
         public_addr: Option<SocketAddr>,
+        tuning: IceTuning,
+        observer: Option<IceObserver>,
     ) -> Option<IceMaterial> {
         if let Some(existing) = self.runtimes.get(session_id) {
-            return Some(existing.material.clone());
+            let mut material = existing.material.clone();
+            if let (true, Some(pending)) = (offerer, existing.pending_local.as_ref()) {
+                material.ufrag.clone_from(&pending.ufrag);
+                material.pwd.clone_from(&pending.pwd);
+            }
+            return Some(material);
         }
         let Some(transport) = controller.ice_transport(dialog_id).await else {
             tracing::warn!(
@@ -154,7 +216,7 @@ impl IceRuntimes {
             }
         }
 
-        let config = if lite {
+        let mut config = if lite {
             AgentConfig::lite(credentials.clone())
         } else {
             AgentConfig::full(
@@ -166,6 +228,7 @@ impl IceRuntimes {
                 credentials.clone(),
             )
         };
+        config.consent_expiry = tuning.consent_expiry;
         let mut agent = IceAgent::new(config);
         for candidate in &candidates {
             agent.add_local_candidate(candidate.clone());
@@ -185,6 +248,7 @@ impl IceRuntimes {
             Arc::clone(&transport),
             agent,
             commands_rx,
+            observer,
         ));
         self.runtimes.insert(
             session_id.clone(),
@@ -193,6 +257,8 @@ impl IceRuntimes {
                 material: material.clone(),
                 task: task.abort_handle(),
                 transport,
+                remote: None,
+                pending_local: None,
             },
         );
         Some(material)
@@ -201,11 +267,14 @@ impl IceRuntimes {
     /// Hand the peer's material to the session's agent. Returns whether a
     /// runtime existed to receive it.
     pub(crate) async fn apply_remote(&self, session_id: &SessionId, remote: RemoteIce) -> bool {
-        let Some(runtime) = self.runtimes.get(session_id) else {
-            return false;
+        let commands = {
+            let Some(mut runtime) = self.runtimes.get_mut(session_id) else {
+                return false;
+            };
+            runtime.remote = Some(remote.credentials.clone());
+            runtime.commands.clone()
         };
-        runtime
-            .commands
+        commands
             .send(IceCommand::SetRemote {
                 credentials: remote.credentials,
                 candidates: remote.candidates,
@@ -213,6 +282,84 @@ impl IceRuntimes {
             })
             .await
             .is_ok()
+    }
+
+    /// Whether `remote` credentials in a new offer or answer restart ICE
+    /// for this session: a runtime exists, it has applied the peer's
+    /// credentials before, and the ufrag or password differs
+    /// (RFC 8839 §4.4.1.1.1).
+    pub(crate) fn is_restart(&self, session_id: &SessionId, remote: &Credentials) -> bool {
+        self.runtimes.get(session_id).is_some_and(|runtime| {
+            runtime
+                .remote
+                .as_ref()
+                .is_some_and(|applied| applied != remote)
+        })
+    }
+
+    /// The session's committed local material, if a runtime exists.
+    pub(crate) fn local_material(&self, session_id: &SessionId) -> Option<IceMaterial> {
+        self.runtimes
+            .get(session_id)
+            .map(|runtime| runtime.material.clone())
+    }
+
+    /// Commit an ICE restart: the agent restarts on `local` and takes the
+    /// peer's new material; later SDP repeats `local`. Media stays on the
+    /// old pair until the peer (or, for a full agent, this side) nominates
+    /// a new one. Returns whether a runtime existed.
+    pub(crate) async fn restart(
+        &self,
+        session_id: &SessionId,
+        local: Credentials,
+        remote: RemoteIce,
+    ) -> bool {
+        let commands = {
+            let Some(mut runtime) = self.runtimes.get_mut(session_id) else {
+                return false;
+            };
+            runtime.material.ufrag.clone_from(&local.ufrag);
+            runtime.material.pwd.clone_from(&local.pwd);
+            runtime.remote = Some(remote.credentials.clone());
+            runtime.pending_local = None;
+            runtime.commands.clone()
+        };
+        commands
+            .send(IceCommand::Restart {
+                local,
+                credentials: remote.credentials,
+                candidates: remote.candidates,
+                remote_lite: remote.lite,
+            })
+            .await
+            .is_ok()
+    }
+
+    /// Offerer-side restart: choose new local credentials for the session's
+    /// next offer. The running agent keeps the old ones until an answer
+    /// commits the restart. Idempotent until then; `None` without a runtime.
+    pub(crate) fn restart_local(&self, session_id: &SessionId) -> Option<Credentials> {
+        let mut runtime = self.runtimes.get_mut(session_id)?;
+        Some(
+            runtime
+                .pending_local
+                .get_or_insert_with(Credentials::generate)
+                .clone(),
+        )
+    }
+
+    /// The new local credentials an uncommitted offer carried, if any.
+    pub(crate) fn pending_local(&self, session_id: &SessionId) -> Option<Credentials> {
+        self.runtimes
+            .get(session_id)
+            .and_then(|runtime| runtime.pending_local.clone())
+    }
+
+    /// The offer that carried a restart was not accepted: forget it.
+    pub(crate) fn discard_pending_restart(&self, session_id: &SessionId) {
+        if let Some(mut runtime) = self.runtimes.get_mut(session_id) {
+            runtime.pending_local = None;
+        }
     }
 
     /// Whether a runtime exists for this session.
@@ -247,7 +394,13 @@ async fn run_ice_pump(
     transport: Arc<dyn RtpTransport>,
     mut agent: IceAgent,
     mut commands: mpsc::Receiver<IceCommand>,
+    observer: Option<IceObserver>,
 ) {
+    let notify = |event: IcePathEvent| {
+        if let Some(observer) = observer.as_ref() {
+            observer(event);
+        }
+    };
     let mut stun_events = transport.subscribe();
     loop {
         agent.handle_timeout(Instant::now());
@@ -280,9 +433,15 @@ async fn run_ice_pump(
                         session = %session_label,
                         "ICE consent expired: the peer stopped answering; media may be black-holed"
                     );
+                    notify(IcePathEvent::Lost);
                 }
-                IceEvent::ConsentResumed { .. } => {
-                    tracing::info!(session = %session_label, "ICE consent resumed");
+                IceEvent::ConsentResumed { silent } => {
+                    tracing::info!(
+                        session = %session_label,
+                        silent_ms = u64::try_from(silent.as_millis()).unwrap_or(u64::MAX),
+                        "ICE consent resumed"
+                    );
+                    notify(IcePathEvent::Restored { silent });
                 }
                 IceEvent::StateChanged(state) => {
                     tracing::debug!(session = %session_label, ?state, "ICE state");
@@ -322,6 +481,20 @@ async fn run_ice_pump(
                     if let Some((_, remote)) = agent.selected_pair() {
                         retarget_to_selected(&session_label, &controller, &dialog_id, remote).await;
                     }
+                }
+                Some(IceCommand::Restart { local, credentials, candidates, remote_lite }) => {
+                    // The transport keeps its hold on the old nominated
+                    // address; the next nomination replaces it.
+                    agent.restart(local);
+                    if remote_lite {
+                        agent.set_role(IceRole::Controlling);
+                    }
+                    agent.set_remote_credentials(credentials);
+                    for candidate in candidates {
+                        agent.add_remote_candidate(candidate);
+                    }
+                    tracing::info!(session = %session_label, "ICE restarted on new credentials");
+                    notify(IcePathEvent::Restarted);
                 }
                 None => break,
             },
@@ -518,6 +691,8 @@ mod tests {
                 false,
                 our_addr,
                 None,
+                IceTuning::default(),
+                None,
             )
             .await
             .expect("lite material");
@@ -585,6 +760,250 @@ mod tests {
             "media lands on our real RTP port"
         );
         runtimes.stop(&session_id);
+    }
+
+    /// Drive `peer` over `socket` until it completes or `within` passes.
+    async fn drive_peer(
+        peer: &mut IceAgent,
+        socket: &tokio::net::UdpSocket,
+        within: Duration,
+        until: impl Fn(&IceAgent) -> bool,
+    ) {
+        let local = socket.local_addr().unwrap();
+        let deadline = tokio::time::Instant::now() + within;
+        let mut buffer = [0_u8; 1500];
+        while tokio::time::Instant::now() < deadline && !until(peer) {
+            peer.handle_timeout(Instant::now());
+            while let Some(transmit) = peer.poll_transmit() {
+                socket
+                    .send_to(&transmit.payload, transmit.to)
+                    .await
+                    .unwrap();
+            }
+            while peer.poll_event().is_some() {}
+            if let Ok(Ok((size, from))) =
+                tokio::time::timeout(Duration::from_millis(20), socket.recv_from(&mut buffer)).await
+            {
+                let _ = peer.handle_packet(Instant::now(), local, from, &buffer[..size]);
+            }
+        }
+    }
+
+    /// The pump reports the media path to the application: lost when the
+    /// peer stops checking for the consent timeout, restored when it checks
+    /// again, restarted when a restart commits; and after the restart a
+    /// nomination from a new address moves media there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pump_reports_consent_loss_restoration_and_restart() {
+        use rvoip_ice_core::{AgentConfig, IceRole, IceState};
+        use rvoip_media_core::relay::controller::MediaConfig;
+
+        let controller = Arc::new(MediaSessionController::new());
+        let dialog = DialogId::new("ice-pump-path-events");
+        controller
+            .start_media(
+                dialog.clone(),
+                MediaConfig {
+                    local_addr: "127.0.0.1:0".parse().unwrap(),
+                    remote_addr: None,
+                    preferred_codec: None,
+                    parameters: Default::default(),
+                },
+            )
+            .await
+            .expect("start media");
+        let info = controller.get_session_info(&dialog).await.unwrap();
+        let our_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), info.rtp_port.unwrap());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer: IceObserver = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |event| seen.lock().unwrap().push(event))
+        };
+        let runtimes = IceRuntimes::default();
+        let session_id = SessionId("ice-pump-path-events".into());
+        let material = runtimes
+            .ensure_local(
+                &session_id,
+                &dialog,
+                &controller,
+                SipIcePolicy::Lite,
+                false,
+                our_addr,
+                None,
+                IceTuning {
+                    consent_expiry: Duration::from_millis(300),
+                },
+                Some(observer),
+            )
+            .await
+            .expect("lite material");
+        let ours = Credentials {
+            ufrag: material.ufrag.clone(),
+            pwd: material.pwd.clone(),
+        };
+
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = socket.local_addr().unwrap();
+        let mut peer = IceAgent::new(AgentConfig::full(
+            IceRole::Controlling,
+            Credentials::generate(),
+        ));
+        peer.add_local_candidate(Candidate::host(peer_addr, 1, 65_535));
+        peer.set_remote_credentials(ours.clone());
+        peer.add_remote_candidate(material.candidates[0].clone());
+        let first_remote = RemoteIce {
+            credentials: peer.local_credentials().clone(),
+            candidates: vec![Candidate::host(peer_addr, 1, 65_535)],
+            lite: false,
+            mismatch: false,
+        };
+        assert!(!runtimes.is_restart(&session_id, &first_remote.credentials));
+        assert!(
+            runtimes
+                .apply_remote(&session_id, first_remote.clone())
+                .await
+        );
+        assert!(!runtimes.is_restart(&session_id, &first_remote.credentials));
+        drive_peer(&mut peer, &socket, Duration::from_secs(5), |peer| {
+            peer.state() == IceState::Completed
+        })
+        .await;
+        assert_eq!(peer.state(), IceState::Completed);
+
+        // The peer goes quiet: the lite side reports the path lost, once.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(seen.lock().unwrap().as_slice(), &[IcePathEvent::Lost]);
+
+        // One authenticated check later the path is restored.
+        let mut prober = IceAgent::new(AgentConfig::full(
+            IceRole::Controlling,
+            first_remote.credentials.clone(),
+        ));
+        prober.add_local_candidate(Candidate::host(peer_addr, 1, 65_535));
+        prober.set_remote_credentials(ours);
+        prober.add_remote_candidate(material.candidates[0].clone());
+        drive_peer(&mut prober, &socket, Duration::from_secs(3), |_| {
+            seen.lock().unwrap().len() >= 2
+        })
+        .await;
+        assert!(
+            matches!(
+                seen.lock().unwrap().get(1),
+                Some(IcePathEvent::Restored { silent }) if *silent >= Duration::from_millis(300)
+            ),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+
+        // The peer moved and restarted ICE.
+        let moved = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let moved_addr = moved.local_addr().unwrap();
+        let restarted_remote = RemoteIce {
+            credentials: Credentials::generate(),
+            candidates: vec![Candidate::host(moved_addr, 1, 65_535)],
+            lite: false,
+            mismatch: false,
+        };
+        assert!(runtimes.is_restart(&session_id, &restarted_remote.credentials));
+        let new_local = Credentials::generate();
+        assert!(
+            runtimes
+                .restart(&session_id, new_local.clone(), restarted_remote.clone())
+                .await
+        );
+        let material = runtimes.local_material(&session_id).unwrap();
+        assert_eq!(
+            material.ufrag, new_local.ufrag,
+            "later SDP repeats the new credentials"
+        );
+        let mut moved_peer = IceAgent::new(AgentConfig::full(
+            IceRole::Controlling,
+            restarted_remote.credentials.clone(),
+        ));
+        moved_peer.add_local_candidate(Candidate::host(moved_addr, 1, 65_535));
+        moved_peer.set_remote_credentials(new_local);
+        moved_peer.add_remote_candidate(material.candidates[0].clone());
+        drive_peer(&mut moved_peer, &moved, Duration::from_secs(5), |peer| {
+            peer.state() == IceState::Completed
+        })
+        .await;
+        assert_eq!(moved_peer.state(), IceState::Completed);
+        assert!(seen.lock().unwrap().contains(&IcePathEvent::Restarted));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let live = controller
+                .media_diagnostics(&dialog)
+                .await
+                .and_then(|diagnostics| diagnostics.current_remote_addr);
+            if live == Some(moved_addr) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "media must follow the nomination after the restart: {live:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        runtimes.stop(&session_id);
+    }
+
+    /// An offerer-side restart puts new credentials in the next offer only,
+    /// and a discarded one leaves the committed material.
+    #[tokio::test]
+    async fn an_offerer_restart_changes_only_the_next_offer() {
+        use rvoip_media_core::relay::controller::MediaConfig;
+        let controller = Arc::new(MediaSessionController::new());
+        let dialog = DialogId::new("ice-offer-restart");
+        controller
+            .start_media(
+                dialog.clone(),
+                MediaConfig {
+                    local_addr: "127.0.0.1:0".parse().unwrap(),
+                    remote_addr: None,
+                    preferred_codec: None,
+                    parameters: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let runtimes = IceRuntimes::default();
+        let session = SessionId("ice-offer-restart".into());
+        let ensure = |offerer| {
+            runtimes.ensure_local(
+                &session,
+                &dialog,
+                &controller,
+                SipIcePolicy::Full,
+                offerer,
+                addr,
+                None,
+                IceTuning::default(),
+                None,
+            )
+        };
+        let first = ensure(true).await.unwrap();
+        assert!(runtimes
+            .restart_local(&SessionId("no-such".into()))
+            .is_none());
+        let pending = runtimes.restart_local(&session).unwrap();
+        assert_eq!(
+            runtimes.restart_local(&session).unwrap(),
+            pending,
+            "idempotent"
+        );
+        let offer = ensure(true).await.unwrap();
+        assert_eq!(offer.ufrag, pending.ufrag);
+        assert_ne!(offer.ufrag, first.ufrag);
+        let answer = ensure(false).await.unwrap();
+        assert_eq!(
+            answer.ufrag, first.ufrag,
+            "answers keep the committed material"
+        );
+        runtimes.discard_pending_restart(&session);
+        assert_eq!(ensure(true).await.unwrap().ufrag, first.ufrag);
+        runtimes.stop(&session);
     }
     use super::*;
 
