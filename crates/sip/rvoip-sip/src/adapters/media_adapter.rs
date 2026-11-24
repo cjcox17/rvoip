@@ -4809,6 +4809,17 @@ impl MediaAdapter {
         Ok(())
     }
 
+    /// The RTP timestamp the session's next audio would be sent with if it
+    /// started now; see [`UnifiedCoordinator::next_rtp_timestamp`].
+    ///
+    /// [`UnifiedCoordinator::next_rtp_timestamp`]: crate::api::unified::UnifiedCoordinator::next_rtp_timestamp
+    pub async fn next_rtp_timestamp(&self, session_id: &SessionId) -> Result<Option<u32>> {
+        let exact = self.current_media(session_id).ok_or_else(|| {
+            SessionError::MediaError(format!("No media session for {}", session_id.0))
+        })?;
+        Ok(self.controller.next_rtp_timestamp(&exact.dialog_id).await)
+    }
+
     /// Send one frame through the exact media lifetime retained by a
     /// `SessionHandle`. No raw SessionId lookup or post-await TOCTOU check is
     /// involved.

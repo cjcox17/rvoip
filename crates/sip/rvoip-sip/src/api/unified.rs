@@ -12750,6 +12750,22 @@ impl UnifiedCoordinator {
         self.media_adapter.send_audio_frame(session_id, frame).await
     }
 
+    /// The RTP timestamp audio sent to this session would get if it
+    /// started now: just after the last packet the session's outgoing
+    /// stream sent (audio from [`Self::send_audio`], a media bridge, DTMF),
+    /// advanced by the wall time since. `Ok(None)` before the stream has
+    /// sent anything.
+    ///
+    /// Every packet a session sends is rebased onto one continuous RTP
+    /// timeline, so audio sent with [`Self::send_audio`] never moves the
+    /// stream backwards whatever its frames' timestamps. A caller that
+    /// stamps the first frame of a prompt from this value (and each later
+    /// frame by its sample count) is sent with exactly the timestamps it
+    /// stamped.
+    pub async fn next_rtp_timestamp(&self, session_id: &SessionId) -> Result<Option<u32>> {
+        self.media_adapter.next_rtp_timestamp(session_id).await
+    }
+
     pub(crate) async fn send_audio_exact(
         &self,
         handle: &SessionRegistryHandle,
