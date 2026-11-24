@@ -109,7 +109,18 @@ pub enum IceEvent {
     /// A role conflict repaired our role (RFC 8445 §7.3.1.1).
     RoleChanged(IceRole),
     /// The peer stopped answering consent checks (RFC 7675): stop sending.
+    ///
+    /// A lite agent sends no checks; for it this means the peer has sent no
+    /// authenticated check (nor a Binding Indication from the selected
+    /// pair's remote address) for [`AgentConfig::consent_expiry`] since a
+    /// pair was selected. Reported once per silence.
     ConsentExpired,
+    /// Consent came back after [`IceEvent::ConsentExpired`]: an
+    /// authenticated check (lite) or consent response (full) arrived.
+    ConsentResumed {
+        /// How long the peer had been silent.
+        silent: Duration,
+    },
 }
 
 /// Tunables. The retransmit ladder deviates from RFC 8489's Rc=7 default —
@@ -141,6 +152,7 @@ pub struct AgentConfig {
     /// Keepalive/consent cadence on the nominated pair.
     pub keepalive_interval: Duration,
     /// Silence on consent checks after which the peer is presumed gone.
+    /// A lite agent applies it to the peer's own checks (it sends none).
     pub consent_expiry: Duration,
 }
 
@@ -249,6 +261,10 @@ pub struct IceAgent {
     next_keepalive_at: Option<Instant>,
     last_consent_at: Option<Instant>,
     consent_expired: bool,
+    /// Lite only: a pair has been selected, so the peer's checks are
+    /// consent evidence. Survives a restart (the media path is still the
+    /// old pair until a new nomination).
+    lite_consent_tracking: bool,
     early_checks: Vec<EarlyCheck>,
 }
 
@@ -279,6 +295,7 @@ impl IceAgent {
             next_keepalive_at: None,
             last_consent_at: None,
             consent_expired: false,
+            lite_consent_tracking: false,
             early_checks: Vec::new(),
             config,
         }
@@ -370,6 +387,10 @@ impl IceAgent {
 
     /// Restart ICE (RFC 8445 §9): new credentials, all checks forgotten.
     /// The application keeps media on the old path until a new selection.
+    ///
+    /// A lite agent keeps its consent clock across the restart: media still
+    /// flows on the old pair, and a peer that never checks with the new
+    /// credentials must still be reported gone.
     pub fn restart(&mut self, credentials: Credentials) {
         self.config.credentials = credentials;
         self.remote_credentials = None;
@@ -381,8 +402,10 @@ impl IceAgent {
         self.nomination_sent = false;
         self.selected = None;
         self.next_keepalive_at = None;
-        self.last_consent_at = None;
-        self.consent_expired = false;
+        if !self.config.lite {
+            self.last_consent_at = None;
+            self.consent_expired = false;
+        }
         self.set_state(IceState::Checking);
     }
 
@@ -406,7 +429,14 @@ impl IceAgent {
                 self.process_response(now, source, &message);
             }
             MessageClass::Indication => {
-                // Keepalive received; nothing to answer (RFC 8445 §11).
+                // Keepalive received; nothing to answer (RFC 8445 §11). A
+                // lite agent counts one from the selected pair's peer as
+                // consent: peers that are not browsers keep the pair alive
+                // with Binding Indications instead of checks. Indications
+                // carry no integrity, so only the selected source counts.
+                if self.config.lite && self.selected == Some((local, source)) {
+                    self.note_lite_consent(now);
+                }
             }
         }
         Ok(())
@@ -505,6 +535,9 @@ impl IceAgent {
         ));
 
         if self.config.lite {
+            // Every authenticated check is consent evidence (RFC 7675 §5.1,
+            // from the side that receives the checks).
+            self.note_lite_consent(now);
             // Lite adopts the controlling peer's nomination and needs no
             // pair bookkeeping of its own.
             if message.use_candidate && self.selected != Some((local, source)) {
@@ -514,6 +547,7 @@ impl IceAgent {
                     remote: source,
                 });
                 self.set_state(IceState::Completed);
+                self.lite_consent_tracking = true;
             }
             return;
         }
@@ -632,6 +666,13 @@ impl IceAgent {
         let flight = self.in_flight.remove(position);
 
         if flight.consent {
+            if self.consent_expired {
+                self.consent_expired = false;
+                let silent = self
+                    .last_consent_at
+                    .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
+                self.events.push_back(IceEvent::ConsentResumed { silent });
+            }
             self.last_consent_at = Some(now);
             return;
         }
@@ -696,10 +737,43 @@ impl IceAgent {
     /// Advance timers: pacing, retransmits, nomination, keepalives, consent.
     pub fn handle_timeout(&mut self, now: Instant) {
         self.retransmit_due(now);
-        if !self.config.lite {
+        if self.config.lite {
+            self.lite_consent_due(now);
+        } else {
             self.pace_checks(now);
             self.maybe_nominate(now);
             self.keepalive_due(now);
+        }
+    }
+
+    /// An authenticated check reached a lite agent.
+    fn note_lite_consent(&mut self, now: Instant) {
+        if self.consent_expired {
+            self.consent_expired = false;
+            let silent = self
+                .last_consent_at
+                .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
+            self.events.push_back(IceEvent::ConsentResumed { silent });
+        }
+        self.last_consent_at = Some(now);
+    }
+
+    /// The lite consent deadline, while one is armed.
+    fn lite_consent_deadline(&self) -> Option<Instant> {
+        if !self.lite_consent_tracking || self.consent_expired {
+            return None;
+        }
+        self.last_consent_at
+            .map(|last| last + self.config.consent_expiry)
+    }
+
+    fn lite_consent_due(&mut self, now: Instant) {
+        if self
+            .lite_consent_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.consent_expired = true;
+            self.events.push_back(IceEvent::ConsentExpired);
         }
     }
 
@@ -940,6 +1014,8 @@ impl IceAgent {
             if self.selected.is_some() && !self.consent_expired {
                 consider(self.last_consent_at.map(|t| t + self.config.consent_expiry));
             }
+        } else {
+            consider(self.lite_consent_deadline());
         }
         earliest
     }

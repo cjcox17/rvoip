@@ -2553,6 +2553,10 @@ impl DialogManager {
         // are not session refreshes and carry neither header.
         let session_refresh_method =
             matches!(transaction_id.method(), Method::Invite | Method::Update);
+        // RFC 3261 §12.2.2 / RFC 6141 §3.4: a 2xx to an in-dialog INVITE or
+        // UPDATE (both target refresh requests) replaces the remote target
+        // with the request's Contact, once the response is on the wire.
+        let mut target_refresh: Option<(DialogId, Uri)> = None;
         if response.status().is_success() && session_refresh_method {
             let dialog_id = self
                 .transaction_to_dialog
@@ -2564,6 +2568,22 @@ impl DialogManager {
                 .await
                 .ok()
                 .flatten();
+            if let (Some(dialog_id), Some(request)) = (dialog_id.as_ref(), request.as_ref()) {
+                let in_dialog = request.to().is_some_and(|to| to.tag().is_some());
+                if in_dialog {
+                    if let Some(TypedHeader::Contact(contacts)) =
+                        request.header(&HeaderName::Contact)
+                    {
+                        if let Some(remote_target) = contacts
+                            .0
+                            .first()
+                            .and_then(|contact| extract_uri_from_contact(contact).ok())
+                        {
+                            target_refresh = Some((dialog_id.clone(), remote_target));
+                        }
+                    }
+                }
+            }
             // §9: a 2xx to an in-dialog refresh renegotiates from *that*
             // request — its interval, Min-SE and refresher — instead of
             // echoing the dialog's previous values. The dialog-creating
@@ -2724,6 +2744,32 @@ impl DialogManager {
         if let Some(dialog_id) = final_invite_dialog.as_ref() {
             self.reliable_provisional_tasks
                 .release_transaction(dialog_id, transaction_id);
+        }
+
+        if let Some((dialog_id, remote_target)) = target_refresh {
+            if let Ok(mut dialog) = self.get_dialog_mut(&dialog_id) {
+                if dialog.state != DialogState::Terminated && dialog.remote_target != remote_target
+                {
+                    let contact_scheme = safe_uri_scheme_class(&remote_target);
+                    let contact_transport = safe_uri_transport_class(&remote_target);
+                    if dialog.update_remote_target(remote_target) {
+                        debug!(
+                            dialog=%dialog_id,
+                            contact_scheme,
+                            contact_transport,
+                            "Remote target refreshed from an accepted in-dialog request's Contact"
+                        );
+                    } else {
+                        warn!(
+                            dialog=%dialog_id,
+                            contact_scheme,
+                            contact_transport,
+                            required_scheme = "sips",
+                            "Rejected insecure Contact target refresh for secure dialog"
+                        );
+                    }
+                }
+            }
         }
 
         debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), "Successfully sent response");

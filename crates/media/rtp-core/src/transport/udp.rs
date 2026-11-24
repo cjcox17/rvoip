@@ -102,6 +102,28 @@ fn rtp_diagnostics_enabled() -> bool {
     RTP_DIAGNOSTICS_ENABLED.load(Ordering::Relaxed)
 }
 
+/// An epoch-0 DTLS handshake record carrying a ClientHello (RFC 6347
+/// §4.1: content type 22, epoch at bytes 3-4, handshake type at byte 13).
+#[cfg(feature = "dtls-webrtc")]
+fn is_dtls_client_hello(datagram: &[u8]) -> bool {
+    datagram.len() > 13
+        && datagram[0] == 22
+        && datagram[3] == 0
+        && datagram[4] == 0
+        && datagram[13] == 1
+}
+
+/// The `random` of an epoch-0 ClientHello (RFC 6347 §4.2.2: 13-byte record
+/// header, 12-byte handshake header, 2-byte client_version, then 32 bytes).
+/// Retransmissions and the cookie retry of one handshake repeat it.
+#[cfg(feature = "dtls-webrtc")]
+fn dtls_client_hello_random(datagram: &[u8]) -> Option<[u8; 32]> {
+    if !is_dtls_client_hello(datagram) {
+        return None;
+    }
+    datagram.get(27..59)?.try_into().ok()
+}
+
 fn classify_rtp_mux_packet(buffer: &[u8]) -> RtpMuxPacketClass {
     if buffer.len() < 2 {
         return RtpMuxPacketClass::TooSmall;
@@ -521,6 +543,31 @@ pub struct UdpRtpTransport {
     #[cfg(feature = "dtls-webrtc")]
     dtls_tx: Arc<parking_lot::Mutex<Option<mpsc::Sender<Bytes>>>>,
 
+    /// Set once a handshake on this transport completed
+    /// ([`Self::mark_dtls_established`]); cleared when a new one starts.
+    #[cfg(feature = "dtls-webrtc")]
+    dtls_established: Arc<AtomicBool>,
+
+    /// Counts ClientHellos that arrived after the association was
+    /// established: the peer started a new handshake on the same transport
+    /// (RFC 8842 §5 lets a peer do that after an address change). The
+    /// datagram is not handed to the finished handshake; the owner of the
+    /// association decides whether to answer it with a new handshake.
+    #[cfg(feature = "dtls-webrtc")]
+    dtls_client_hello: Arc<tokio::sync::watch::Sender<u64>>,
+
+    /// While set, DTLS is handed to the handshake only from the current
+    /// remote RTP address: a handshake on an established association
+    /// (a re-handshake, or a new association replacing it) must not take
+    /// datagrams from anyone else.
+    #[cfg(feature = "dtls-webrtc")]
+    dtls_peer_only: Arc<AtomicBool>,
+
+    /// The `random` of the last ClientHello handed to a handshake or
+    /// reported as a new one: a late duplicate of it is not a new handshake.
+    #[cfg(feature = "dtls-webrtc")]
+    dtls_last_client_hello: Arc<parking_lot::Mutex<Option<[u8; 32]>>>,
+
     #[cfg(feature = "memory-diagnostics")]
     _memory_guard: rvoip_infra_common::memory_diagnostics::ObjectGuard,
     #[cfg(feature = "memory-diagnostics")]
@@ -703,6 +750,14 @@ impl UdpRtpTransport {
             dtmf_seen: Arc::new(DashMap::new()),
             #[cfg(feature = "dtls-webrtc")]
             dtls_tx: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "dtls-webrtc")]
+            dtls_established: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "dtls-webrtc")]
+            dtls_client_hello: Arc::new(tokio::sync::watch::channel(0).0),
+            #[cfg(feature = "dtls-webrtc")]
+            dtls_peer_only: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "dtls-webrtc")]
+            dtls_last_client_hello: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "memory-diagnostics")]
             _memory_guard: rvoip_infra_common::memory_diagnostics::ObjectGuard::new(
                 "rtp_core.udp_transport",
@@ -753,6 +808,14 @@ impl UdpRtpTransport {
         let latched_rtp_ssrc = self.latched_rtp_ssrc.clone();
         #[cfg(feature = "dtls-webrtc")]
         let dtls_tx = self.dtls_tx.clone();
+        #[cfg(feature = "dtls-webrtc")]
+        let dtls_established = self.dtls_established.clone();
+        #[cfg(feature = "dtls-webrtc")]
+        let dtls_client_hello = self.dtls_client_hello.clone();
+        #[cfg(feature = "dtls-webrtc")]
+        let dtls_peer_only = self.dtls_peer_only.clone();
+        #[cfg(feature = "dtls-webrtc")]
+        let dtls_last_client_hello = self.dtls_last_client_hello.clone();
         let srtp_diagnostics = srtp_diagnostics_enabled();
         let rtp_diagnostics = rtp_diagnostics_enabled();
         let local_rtp_addr = rtp_socket.local_addr().ok();
@@ -805,7 +868,49 @@ impl UdpRtpTransport {
                             }
 
                             #[cfg(feature = "dtls-webrtc")]
+                            let from_peer = packet_class == RtpMuxPacketClass::Dtls
+                                && remote_rtp_addr.load().as_deref() == Some(&addr);
+
+                            #[cfg(feature = "dtls-webrtc")]
+                            if packet_class == RtpMuxPacketClass::Dtls
+                                && dtls_established.load(Ordering::Acquire)
+                                && is_dtls_client_hello(&buffer[..size])
+                            {
+                                // A ClientHello on an established
+                                // association never reaches the finished
+                                // handshake. It is a new handshake only
+                                // when it comes from the peer media is
+                                // sent to and is not a late copy of the
+                                // one already answered; its owner is then
+                                // told (the peer retransmits it).
+                                // Anything else is dropped.
+                                ReceiveCounters::bump(&counters.dtls_dropped);
+                                let random = dtls_client_hello_random(&buffer[..size]);
+                                if from_peer {
+                                    let mut last = dtls_last_client_hello.lock();
+                                    if random.is_some() && *last != random {
+                                        *last = random;
+                                        drop(last);
+                                        dtls_client_hello.send_modify(|count| *count += 1);
+                                    }
+                                }
+                                continue;
+                            }
+
+                            #[cfg(feature = "dtls-webrtc")]
+                            if packet_class == RtpMuxPacketClass::Dtls
+                                && dtls_peer_only.load(Ordering::Acquire)
+                                && !from_peer
+                            {
+                                ReceiveCounters::bump(&counters.dtls_dropped);
+                                continue;
+                            }
+
+                            #[cfg(feature = "dtls-webrtc")]
                             if packet_class == RtpMuxPacketClass::Dtls {
+                                if let Some(random) = dtls_client_hello_random(&buffer[..size]) {
+                                    *dtls_last_client_hello.lock() = Some(random);
+                                }
                                 let forwarded = dtls_tx
                                     .lock()
                                     .as_ref()
@@ -1376,6 +1481,17 @@ impl UdpRtpTransport {
         let _writer = self.destination_writer.lock();
         self.ice_selected_rtp_addr.store(Some(Arc::new(addr)));
         self.retarget(addr);
+        self.retarget_muxed_rtcp(addr);
+    }
+
+    /// Multiplexed RTCP shares the RTP destination (RFC 5761): keep it on
+    /// the address media now goes to. RTCP on a separate socket keeps its
+    /// own (signalled) destination.
+    fn retarget_muxed_rtcp(&self, addr: SocketAddr) {
+        let separate = !self.rtcp_mux.load(Ordering::Acquire) && self.rtcp_socket.load().is_some();
+        if !separate {
+            self.remote_rtcp_addr.store(Some(Arc::new(addr)));
+        }
     }
 
     /// Forget the ICE-nominated address (the session's ICE agent stopped:
@@ -1388,6 +1504,7 @@ impl UdpRtpTransport {
         }
         if let Some(sdp) = self.sdp_rtp_addr.load().as_deref().copied() {
             self.retarget(sdp);
+            self.retarget_muxed_rtcp(sdp);
         }
     }
 
@@ -1467,6 +1584,11 @@ impl UdpRtpTransport {
 
         let (tx, rx) = mpsc::channel(64);
         *self.dtls_tx.lock() = Some(tx);
+        // A handshake that replaces an established association (the peer
+        // re-handshakes, or a re-offer changed the certificate) takes DTLS
+        // only from the peer media is sent to.
+        let replacing = self.dtls_established.swap(false, Ordering::AcqRel);
+        self.dtls_peer_only.store(replacing, Ordering::Release);
         let _ = self.dtls_before_handshake.compare_exchange(
             u64::MAX,
             self.receive_counters.dtls_dropped.load(Ordering::Relaxed),
@@ -1481,6 +1603,21 @@ impl UdpRtpTransport {
                 rx,
             ),
         ))
+    }
+
+    /// Record that the handshake started by [`Self::dtls_conn_adapter`]
+    /// completed. From now on a ClientHello is a new handshake by the peer
+    /// and is reported through [`Self::subscribe_dtls_client_hello`].
+    #[cfg(feature = "dtls-webrtc")]
+    pub fn mark_dtls_established(&self) {
+        self.dtls_established.store(true, Ordering::Release);
+    }
+
+    /// Watch the count of ClientHellos received on an established
+    /// association. The receiver errors once the transport is gone.
+    #[cfg(feature = "dtls-webrtc")]
+    pub fn subscribe_dtls_client_hello(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.dtls_client_hello.subscribe()
     }
 
     /// Get the remote RTCP address
@@ -2405,6 +2542,140 @@ mod tests {
         transport.clear_ice_selected_rtp_addr();
         assert_eq!(transport.remote_rtp_addr().await, Some(sdp_default));
         assert_eq!(transport.dtls_datagrams_before_handshake(), None);
+    }
+
+    /// Multiplexed RTCP shares the RTP destination (RFC 5761), so it must
+    /// follow every ICE retarget: a nomination after the SDP commit (an
+    /// ICE restart after the peer changed networks) used to leave RTCP on
+    /// the old address.
+    #[tokio::test]
+    async fn muxed_rtcp_follows_an_ice_retarget() {
+        let config = RtpTransportConfig {
+            local_rtp_addr: "127.0.0.1:0".parse().unwrap(),
+            local_rtcp_addr: None,
+            symmetric_rtp: true,
+            rtcp_mux: true,
+            session_id: Some("ice-rtcp-mux".to_string()),
+            use_port_allocator: false,
+            buffer_config: Default::default(),
+        };
+        let transport = UdpRtpTransport::new(config).await.unwrap();
+        let sdp_default: SocketAddr = "198.51.100.5:50000".parse().unwrap();
+        let first: SocketAddr = "203.0.113.20:40000".parse().unwrap();
+        let moved: SocketAddr = "203.0.113.77:51000".parse().unwrap();
+
+        transport.set_remote_rtp_addr(sdp_default).await;
+        transport.store_remote_rtcp_addr(sdp_default);
+        transport.set_ice_selected_rtp_addr(first);
+        assert_eq!(transport.remote_rtcp_addr().await, Some(first));
+        transport.set_ice_selected_rtp_addr(moved);
+        assert_eq!(
+            transport.remote_rtcp_addr().await,
+            Some(moved),
+            "muxed RTCP must follow the new nomination"
+        );
+        transport.clear_ice_selected_rtp_addr();
+        assert_eq!(transport.remote_rtcp_addr().await, Some(sdp_default));
+    }
+
+    /// A ClientHello-shaped datagram: record type 22, epoch 0, handshake
+    /// type 1, `random` filled with `random`.
+    #[cfg(feature = "dtls-webrtc")]
+    fn client_hello(random: u8) -> Vec<u8> {
+        let mut datagram = vec![0_u8; 60];
+        datagram[0] = 22;
+        datagram[1] = 0xFE;
+        datagram[2] = 0xFD;
+        datagram[12] = 47;
+        datagram[13] = 1;
+        datagram[25] = 0xFE;
+        datagram[26] = 0xFD;
+        datagram[27..59].fill(random);
+        datagram
+    }
+
+    /// On an established association only the peer media is sent to can
+    /// start a new handshake, and a late copy of the ClientHello already
+    /// answered does not; a handshake replacing the association then takes
+    /// DTLS only from that peer.
+    #[cfg(feature = "dtls-webrtc")]
+    #[tokio::test]
+    async fn only_the_peer_starts_a_new_dtls_handshake_on_an_established_association() {
+        let config = RtpTransportConfig {
+            local_rtp_addr: "127.0.0.1:0".parse().unwrap(),
+            local_rtcp_addr: None,
+            symmetric_rtp: false,
+            rtcp_mux: true,
+            session_id: Some("dtls-rehandshake".to_string()),
+            use_port_allocator: false,
+            buffer_config: Default::default(),
+        };
+        let transport = UdpRtpTransport::new(config).await.unwrap();
+        let ours = transport.local_rtp_addr().unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        transport
+            .set_remote_rtp_addr(peer.local_addr().unwrap())
+            .await;
+        let mut hellos = transport.subscribe_dtls_client_hello();
+        let settle = || tokio::time::sleep(Duration::from_millis(100));
+
+        // The first handshake sees the peer's ClientHello, then completes.
+        let _first = transport.dtls_conn_adapter().unwrap();
+        peer.send_to(&client_hello(1), ours).await.unwrap();
+        settle().await;
+        assert_eq!(transport.receive_diagnostics().dtls_forwarded, 1);
+        transport.mark_dtls_established();
+
+        // A late copy of that ClientHello, and a stranger's, start nothing.
+        peer.send_to(&client_hello(1), ours).await.unwrap();
+        stranger.send_to(&client_hello(2), ours).await.unwrap();
+        settle().await;
+        assert!(!hellos.has_changed().unwrap(), "no new handshake reported");
+
+        // A new ClientHello from the peer is reported once (its
+        // retransmission is not).
+        peer.send_to(&client_hello(3), ours).await.unwrap();
+        peer.send_to(&client_hello(3), ours).await.unwrap();
+        settle().await;
+        assert!(hellos.has_changed().unwrap());
+        assert_eq!(*hellos.borrow_and_update(), 1);
+
+        // The handshake answering it takes DTLS from the peer only.
+        let _second = transport.dtls_conn_adapter().unwrap();
+        let forwarded = transport.receive_diagnostics().dtls_forwarded;
+        stranger.send_to(&client_hello(4), ours).await.unwrap();
+        settle().await;
+        assert_eq!(transport.receive_diagnostics().dtls_forwarded, forwarded);
+        peer.send_to(&client_hello(3), ours).await.unwrap();
+        settle().await;
+        assert_eq!(
+            transport.receive_diagnostics().dtls_forwarded,
+            forwarded + 1
+        );
+    }
+
+    /// RTCP on its own socket (no mux) keeps its signalled destination:
+    /// ICE only steers the RTP port.
+    #[tokio::test]
+    async fn separate_rtcp_ignores_an_ice_retarget() {
+        let config = RtpTransportConfig {
+            local_rtp_addr: "127.0.0.1:0".parse().unwrap(),
+            local_rtcp_addr: Some("127.0.0.1:0".parse().unwrap()),
+            symmetric_rtp: true,
+            rtcp_mux: false,
+            session_id: Some("ice-rtcp-separate".to_string()),
+            use_port_allocator: false,
+            buffer_config: Default::default(),
+        };
+        let transport = UdpRtpTransport::new(config).await.unwrap();
+        let rtcp: SocketAddr = "198.51.100.5:50001".parse().unwrap();
+        transport
+            .set_remote_rtp_addr("198.51.100.5:50000".parse().unwrap())
+            .await;
+        transport.store_remote_rtcp_addr(rtcp);
+        transport.set_ice_selected_rtp_addr("203.0.113.20:40000".parse().unwrap());
+        assert_eq!(transport.remote_rtcp_addr().await, Some(rtcp));
     }
 
     #[tokio::test]

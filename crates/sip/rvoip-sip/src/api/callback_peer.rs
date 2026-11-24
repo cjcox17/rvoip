@@ -2400,7 +2400,10 @@ impl<H: CallHandler> CallbackPeer<H> {
                 }
 
                 // Observational: delivered through `on_event` above.
-                Event::MediaSecurityFailed { .. } => {}
+                Event::MediaSecurityFailed { .. }
+                | Event::MediaPathLost { .. }
+                | Event::MediaPathRestored { .. }
+                | Event::IceRestarted { .. } => {}
 
                 Event::ReferReceived {
                     call_id: _, refer_to: _, request, ..

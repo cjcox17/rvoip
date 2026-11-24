@@ -596,3 +596,255 @@ fn wrong_passwords_never_validate_and_fail_closed() {
         "nothing may validate across a wrong password"
     );
 }
+
+/// Send one binding request to a lite `agent` on `local` from `source`,
+/// authenticated with `as_peer_of` (the lite agent's credentials as the
+/// peer knows them), and return the reply's class and error code.
+fn lite_check(
+    agent: &mut IceAgent,
+    now: Instant,
+    local: SocketAddr,
+    source: SocketAddr,
+    as_peer_of: &Credentials,
+    use_candidate: bool,
+) -> (MessageClass, Option<u16>) {
+    use rvoip_ice_core::stun::{Attribute, StunMessage, TransactionId};
+    let mut request = StunMessage::binding(MessageClass::Request, TransactionId::random())
+        .with(Attribute::Username(format!("{}:peer", as_peer_of.ufrag)))
+        .with(Attribute::Priority(1_845_501_695))
+        .with(Attribute::IceControlling(42));
+    if use_candidate {
+        request = request.with(Attribute::UseCandidate);
+    }
+    let payload = request.encode(Some(as_peer_of.pwd.as_bytes()), true);
+    agent
+        .handle_packet(now, local, source, &payload)
+        .expect("valid STUN");
+    let reply = agent
+        .poll_transmit()
+        .expect("a lite agent answers every check");
+    assert_eq!(
+        reply.to, source,
+        "the reply goes back to the check's source"
+    );
+    let parsed = parse(&reply.payload).expect("reply parses");
+    (parsed.class, parsed.error.map(|(code, _)| code))
+}
+
+fn drain(agent: &mut IceAgent) -> Vec<IceEvent> {
+    std::iter::from_fn(|| agent.poll_event()).collect()
+}
+
+/// RFC 8445 §9: after an ICE restart the lite agent answers only the new
+/// credentials, and a USE-CANDIDATE check from a new source address (the
+/// peer moved networks) replaces the selected pair.
+#[test]
+fn a_restarted_lite_agent_rejects_old_credentials_and_adopts_a_new_address() {
+    let local: SocketAddr = "198.51.100.5:5004".parse().unwrap();
+    let old_source: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+    let new_source: SocketAddr = "203.0.113.77:51000".parse().unwrap();
+    let old = creds("srvr", "server-password-of-22char");
+    let new = creds("srv2", "server-password-2-of-22ch");
+    let mut agent = IceAgent::new(AgentConfig::lite(old.clone()));
+    agent.add_local_candidate(Candidate::host(local, 1, 65_535));
+    let start = Instant::now();
+
+    assert_eq!(
+        lite_check(&mut agent, start, local, old_source, &old, true),
+        (MessageClass::SuccessResponse, None)
+    );
+    assert_eq!(agent.selected_pair(), Some((local, old_source)));
+    drain(&mut agent);
+
+    agent.restart(new.clone());
+    assert_eq!(agent.local_credentials(), &new);
+    let later = start + Duration::from_secs(1);
+    assert_eq!(
+        lite_check(&mut agent, later, local, old_source, &old, true),
+        (MessageClass::ErrorResponse, Some(401)),
+        "the old credentials are rejected after a restart"
+    );
+    assert!(
+        !drain(&mut agent)
+            .iter()
+            .any(|event| matches!(event, IceEvent::Selected { .. })),
+        "an unauthenticated check selects nothing"
+    );
+
+    assert_eq!(
+        lite_check(&mut agent, later, local, new_source, &new, true),
+        (MessageClass::SuccessResponse, None)
+    );
+    assert_eq!(agent.selected_pair(), Some((local, new_source)));
+    assert!(drain(&mut agent).contains(&IceEvent::Selected {
+        local_base: local,
+        remote: new_source,
+    }));
+}
+
+/// RFC 7675 for a lite agent: it never sends checks, so the peer's checks
+/// are its only evidence the peer is still there. Silence for
+/// `consent_expiry` after a selection reports `ConsentExpired` once; the
+/// next authenticated check reports `ConsentResumed` with the silence.
+#[test]
+fn a_lite_agent_reports_consent_expiry_and_resumption() {
+    let server = Host::new(
+        "server",
+        "198.51.100.5:5004",
+        AgentConfig::lite(creds("srvr", "server-password-of-22char")),
+    );
+    let mut client = Host::new(
+        "client",
+        "198.51.100.1:5004",
+        full(IceRole::Controlling, "clnt", 99),
+    );
+    let mut server = server;
+    signal(&mut client, &mut server);
+    let mut sim = Sim::new(client, server);
+    assert!(sim.run_until(Duration::from_secs(5), |sim| {
+        sim.a.agent.state() == IceState::Completed && sim.b.agent.state() == IceState::Completed
+    }));
+    // The lite agent needs the clock for the consent deadline.
+    assert!(
+        sim.b.agent.poll_timeout(sim.now).is_some(),
+        "a lite agent with a selection must schedule its consent deadline"
+    );
+
+    // Checks keep arriving (the client's 15 s consent cadence): no expiry.
+    sim.run_until(Duration::from_secs(45), |_| false);
+    assert!(
+        !sim.b
+            .events
+            .iter()
+            .any(|event| matches!(event, IceEvent::ConsentExpired)),
+        "consent must not expire while the peer keeps checking"
+    );
+
+    // The peer's network goes away.
+    sim.filter = Box::new(|_, _| false);
+    assert!(
+        sim.run_until(Duration::from_secs(40), |sim| {
+            sim.b
+                .events
+                .iter()
+                .any(|event| matches!(event, IceEvent::ConsentExpired))
+        }),
+        "the lite side notices the peer stopped checking"
+    );
+    sim.run_until(Duration::from_secs(30), |_| false);
+    assert_eq!(
+        sim.b
+            .events
+            .iter()
+            .filter(|event| matches!(event, IceEvent::ConsentExpired))
+            .count(),
+        1,
+        "expiry is reported once"
+    );
+
+    // The path comes back: the next consent check resumes.
+    sim.filter = Box::new(|_, _| true);
+    assert!(
+        sim.run_until(Duration::from_secs(20), |sim| {
+            sim.b
+                .events
+                .iter()
+                .any(|event| matches!(event, IceEvent::ConsentResumed { .. }))
+        }),
+        "the next authenticated check resumes consent"
+    );
+    let silent = sim
+        .b
+        .events
+        .iter()
+        .find_map(|event| match event {
+            IceEvent::ConsentResumed { silent } => Some(*silent),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        silent > Duration::from_secs(30),
+        "the silence covers at least the expiry: {silent:?}"
+    );
+}
+
+/// A lite restart keeps the consent clock: a peer that sent the restart
+/// offer and then never checks again (no UDP on its new network) must still
+/// be reported gone.
+#[test]
+fn a_lite_restart_without_new_checks_still_expires_consent() {
+    let local: SocketAddr = "198.51.100.5:5004".parse().unwrap();
+    let source: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+    let old = creds("srvr", "server-password-of-22char");
+    let mut agent = IceAgent::new(AgentConfig::lite(old.clone()));
+    agent.add_local_candidate(Candidate::host(local, 1, 65_535));
+    let start = Instant::now();
+    lite_check(&mut agent, start, local, source, &old, true);
+    drain(&mut agent);
+
+    let restart_at = start + Duration::from_secs(10);
+    agent.handle_timeout(restart_at);
+    agent.restart(creds("srv2", "server-password-2-of-22ch"));
+    let deadline = agent
+        .poll_timeout(restart_at)
+        .expect("the consent deadline survives the restart");
+    assert_eq!(deadline, start + Duration::from_secs(30));
+    agent.handle_timeout(deadline + Duration::from_millis(1));
+    assert!(drain(&mut agent).contains(&IceEvent::ConsentExpired));
+}
+
+/// A lite agent that never had a selection has nothing to expire.
+#[test]
+fn a_lite_agent_without_a_selection_never_expires_consent() {
+    let mut agent = IceAgent::new(AgentConfig::lite(creds(
+        "srvr",
+        "server-password-of-22char",
+    )));
+    agent.add_local_candidate(Candidate::host(
+        "198.51.100.5:5004".parse().unwrap(),
+        1,
+        65_535,
+    ));
+    let now = Instant::now();
+    assert_eq!(agent.poll_timeout(now), None);
+    agent.handle_timeout(now + Duration::from_secs(120));
+    assert!(drain(&mut agent).is_empty());
+}
+
+/// Peers that keep the selected pair alive with Binding Indications (RFC
+/// 8445 §11) rather than checks keep consent on a lite agent; an indication
+/// from any other address does not.
+#[test]
+fn a_lite_agent_counts_indications_from_the_selected_pair_as_consent() {
+    use rvoip_ice_core::stun::{StunMessage, TransactionId};
+    let local: SocketAddr = "198.51.100.5:5004".parse().unwrap();
+    let source: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+    let stranger: SocketAddr = "203.0.113.66:40000".parse().unwrap();
+    let ours = creds("srvr", "server-password-of-22char");
+    let mut agent = IceAgent::new(AgentConfig::lite(ours.clone()));
+    agent.add_local_candidate(Candidate::host(local, 1, 65_535));
+    let start = Instant::now();
+    lite_check(&mut agent, start, local, source, &ours, true);
+    drain(&mut agent);
+    let indication =
+        StunMessage::binding(MessageClass::Indication, TransactionId::random()).encode(None, true);
+
+    // Indications from the selected peer every 15 s: consent holds.
+    for step in 1..=4 {
+        let at = start + Duration::from_secs(15 * step);
+        agent.handle_timeout(at);
+        agent.handle_packet(at, local, source, &indication).unwrap();
+    }
+    agent.handle_timeout(start + Duration::from_secs(80));
+    assert!(drain(&mut agent).is_empty(), "indications keep consent");
+
+    // Indications from another address do not.
+    for step in 1..=4 {
+        let at = start + Duration::from_secs(60 + 10 * step);
+        agent
+            .handle_packet(at, local, stranger, &indication)
+            .unwrap();
+    }
+    agent.handle_timeout(start + Duration::from_secs(91));
+    assert!(drain(&mut agent).contains(&IceEvent::ConsentExpired));
+}
