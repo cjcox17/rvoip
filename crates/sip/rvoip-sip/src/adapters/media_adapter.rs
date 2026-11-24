@@ -11288,6 +11288,7 @@ a=fmtp:101 0-15\r\n";
     // address this endpoint cannot reach (a private host address behind a
     // NAT), while the nominated address is the one the checks proved.
 
+    #[cfg(feature = "dtls-srtp")]
     /// A WebRTC-style offerer: ICE-lite, DTLS-SRTP, rtcp-mux.
     fn ice_lite_dtls_offerer(adapter: &mut MediaAdapter) {
         adapter.set_rtcp_mux_required(true);
@@ -11297,18 +11298,21 @@ a=fmtp:101 0-15\r\n";
 
     /// An address nothing answers on (TEST-NET-1, discard port): the
     /// answer's default when the peer's host address is not reachable.
+    #[cfg(feature = "dtls-srtp")]
     fn unreachable_default() -> SocketAddr {
         "192.0.2.10:9".parse().unwrap()
     }
 
     /// A full, controlling ICE peer on a raw socket that nominates the
     /// offer's candidate, as a browser does.
+    #[cfg(feature = "dtls-srtp")]
     struct IceTestPeer {
         socket: tokio::net::UdpSocket,
         agent: rvoip_ice_core::IceAgent,
         addr: SocketAddr,
     }
 
+    #[cfg(feature = "dtls-srtp")]
     impl IceTestPeer {
         async fn for_offer(offer: &str) -> Self {
             use rvoip_ice_core::{AgentConfig, Candidate, Credentials, IceAgent, IceRole};
@@ -11379,6 +11383,7 @@ a=fmtp:101 0-15\r\n";
 
     /// A browser-style answer whose default address and only candidate are
     /// `default`, with `a=setup:active` (the peer is the DTLS client).
+    #[cfg(feature = "dtls-srtp")]
     fn ice_dtls_answer(
         default: SocketAddr,
         credentials: &rvoip_ice_core::Credentials,
@@ -11408,6 +11413,7 @@ a=fmtp:101 0-15\r\n";
     }
 
     impl NonMuxCall {
+        #[cfg(feature = "dtls-srtp")]
         async fn local_rtp_addr(&self) -> SocketAddr {
             let port = self.info().await.rtp_port.expect("RTP port allocated");
             SocketAddr::from(([127, 0, 0, 1], port))
@@ -11423,6 +11429,7 @@ a=fmtp:101 0-15\r\n";
 
         /// Wait until media is sent to `expected` (the ICE pump retargets
         /// asynchronously).
+        #[cfg(feature = "dtls-srtp")]
         async fn await_live_remote(&self, expected: SocketAddr) {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
             while tokio::time::Instant::now() < deadline {
