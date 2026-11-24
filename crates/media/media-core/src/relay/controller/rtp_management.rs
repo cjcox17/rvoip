@@ -146,6 +146,24 @@ impl MediaSessionController {
         Some(transport)
     }
 
+    /// The RTP timestamp the dialog's next audio would be sent with if it
+    /// started now: just after the last packet sent on the dialog's outgoing
+    /// stream (its own audio, a bridge, DTMF), advanced by the wall time
+    /// since. `None` before the stream has sent anything, or for an unknown
+    /// dialog.
+    ///
+    /// Every packet sent on the stream is rebased onto one continuous
+    /// timeline anyway, so a caller never needs this to keep timestamps
+    /// moving forward. A caller that stamps the first frame of its audio
+    /// from it (and later frames by sample count) is sent with exactly the
+    /// timestamps it stamped, which keeps its own bookkeeping (recording,
+    /// tests) equal to the wire.
+    pub async fn next_rtp_timestamp(&self, dialog_id: &DialogId) -> Option<u32> {
+        let session = self.get_rtp_session(dialog_id).await?;
+        let session = session.lock().await;
+        session.next_timestamp()
+    }
+
     /// Send RTP packet for a dialog.
     ///
     /// Snapshots the session's lock-free `RtpSendHandle` under a brief
